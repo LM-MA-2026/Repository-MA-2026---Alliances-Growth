@@ -34,6 +34,19 @@
     border-radius: 4px;
     font-size: 0.9em;
   }
+  h2 {
+    font-size: 1.1rem;
+    margin-top: 2.2em;
+    margin-bottom: 0.6em;
+    padding-top: 1.2em;
+    border-top: 1px solid #d0d7de;
+  }
+  p.desc-block {
+    color: #333;
+    font-size: 0.95em;
+    margin-top: 0;
+    margin-bottom: 1em;
+  }
   ol {
     padding-left: 1.2em;
   }
@@ -69,6 +82,7 @@
 <h1>Partner Relatedness and Firm Growth: The Role of Industry Distance and Governance in Strategic Alliances</h1>
 <p class="subtitle">Master thesis Repository - Lara Mazzarelli</p>
 <p class="intro">Each part below is a full, rendered analysis report built with Quarto from the R code in this repository.</p>
+<p class="desc-block">This repository holds the analysis code for a master's thesis at the University of St. Gallen (HSG) on how industry (SIC-code) distance between alliance partners relates to focal-firm revenue growth, and how alliance governance form (equity-based vs. non-equity) moderates that relationship.</p>
 
 <ol>
   <li><a href="01_alliance_data.html">Part 1: Alliance data (SDC Platinum)</a>
@@ -97,6 +111,9 @@
   </li>
 </ol>
 
+<h2>Data &amp; reproducibility</h2>
+<p class="desc-block">The raw inputs (SDC Platinum alliance data, Compustat firm data, WRDS exchange rates) are licensed data obtained through WRDS/LSEG and are <strong>not</strong> included in this repository. To rerun the pipeline, obtain your own extracts and point the <code>path</code> variable in <code>00_config.R</code> at the folder that holds them. Intermediate <code>.rds</code> files are excluded since they are large and fully reproducible from the code.</p>
+<p class="desc-block">Requirements: R with <code>data.table</code>, <code>ggplot2</code>, <code>fixest</code> (or equivalent), and Quarto to render the <code>.qmd</code> files.</p>
 <footer>Source code: <a href="https://github.com/LM-MA-2026/Repository-MA-2026---Alliances-Growth">this repository</a></footer>
 
 </body>
