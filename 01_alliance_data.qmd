@@ -1,0 +1,212 @@
+---
+title: "Part 1 Alliance data (SDC Platinum)"
+subtitle: "Master thesis Section 3.1"
+author: "Lara Mazzarelli"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+---
+
+## Role in the pipeline
+
+| | |
+|---|---|
+| **Thesis section** | 3.1 Alliance data |
+| **Input** | `SDC*.xlsx` exports (four date blocks, LSEG Workspace) and `SDC_Technique_*.xlsx` (Alliance Technique, four date blocks) |
+| **Output** | `sdc_participants.rds` (one row per alliance participant), `sdc_counts.rds` (numbers for Table 2) |
+| **Next file** | `02_firm_data.qmd` |
+
+The SDC extract contains one row per alliance, with the two participants
+stored as concatenated text (separated by `;`). This file (1) reads and
+stacks the exports, (2) keeps completed two-partner alliances, and
+(3) splits every alliance into one row per participant, so that each firm
+can later be treated as a focal firm. Each alliance is also classified as
+equity-based or non-equity (section 1b). In the later files the column `jv`
+holds this equity-based indicator (the name is kept so that files 3 to 6 run unchanged).
+
+```{r}
+#| label: setup
+source("00_config.R")
+library(readxl)
+```
+
+## 1. Read and stack the SDC files
+
+Sheet 1 only (sheet 2 contains documentation). Everything is read as text,
+so SIC codes keep their leading zeros.
+
+```{r}
+#| label: read
+files_sdc <- list.files(path, pattern = "^SDC.*\\.xlsx$", full.names = TRUE)
+files_sdc <- files_sdc[!grepl("Technique", basename(files_sdc))]   # technique files are read in 1b
+basename(files_sdc)
+
+read_sdc <- function(f) {
+  d <- read_excel(f, sheet = 1, skip = 2, col_types = "text", .name_repair = "minimal")
+  names(d) <- make.unique(names(d))
+  setDT(d)
+}
+sdc <- rbindlist(lapply(files_sdc, read_sdc), use.names = TRUE)
+dim(sdc)   # 240,565 rows, 44 columns
+
+stopifnot(!anyDuplicated(sdc$`Joint Venture/Alliance SDC Deal Number`))
+
+excel_date <- function(x) as.Date(as.numeric(x), origin = "1899-12-30")
+sdc[, date := excel_date(`Date Announced`)]
+sdc[, year := year(date)]
+```
+
+## 1b. Equity-based vs. non-equity alliances
+
+The SDC Joint Venture Flag only marks alliances in which a new legal entity
+was created. Other equity arrangements are recorded in the field *Alliance
+Technique* (codes ET = Equity Transfer, CET = Cross Equity Transfer). Following
+LSEG support (personal communication, 2026), an alliance is classified as
+**equity-based** if the Joint Venture Flag is true or the technique contains
+ET or CET. All other alliances are **non-equity**. The definition is set in
+`00_config.R` (`equity_definition`); `"jv_only"` gives the robustness version.
+
+The technique field is exported separately (same deals, four date blocks)
+and joined by deal number.
+
+```{r}
+#| label: technique
+files_tech <- list.files(path, pattern = "^SDC_Technique.*\\.xlsx$", full.names = TRUE)
+basename(files_tech)
+
+read_tech <- function(f) {
+  d <- read_excel(f, sheet = 1, skip = 2, col_types = "text", .name_repair = "minimal")
+  setDT(d)
+  d[, .(deal      = `Joint Venture/Alliance SDC Deal Number`,
+        technique = `Alliance Technique (Code)`)]
+}
+tech <- rbindlist(lapply(files_tech, read_tech))
+stopifnot(!anyDuplicated(tech$deal))
+
+# TRUE if any of the (semicolon-separated) technique codes is in `codes`
+has_code <- function(x, codes) {
+  vapply(strsplit(x, ";", fixed = TRUE),
+         function(z) any(trimws(z) %in% codes), logical(1))
+}
+
+sdc[tech, on = c("Joint Venture/Alliance SDC Deal Number" = "deal"),
+    technique := i.technique]
+cat("Share of alliances found in the technique files:",
+    round(mean(sdc$`Joint Venture/Alliance SDC Deal Number` %in% tech$deal), 4), "\n")
+stopifnot(mean(sdc$`Joint Venture/Alliance SDC Deal Number` %in% tech$deal) > 0.99)
+
+sdc[, jv_flag := `Joint Venture Flag` == "True"]
+sdc[, tech_eq := has_code(technique, equity_codes)]
+sdc[, equity  := if (equity_definition == "jv_only") jv_flag else jv_flag | tech_eq]
+
+sdc[, period := fcase(year < 2000, "before 2000", year < 2010, "2000-2009",
+                      year < 2020, "2010-2019", default = "2020 onwards")]
+tab_eq <- sdc[, .(alliances        = .N,
+                  equity_based     = sum(equity),
+                  non_equity       = sum(!equity),
+                  equity_share_pct = round(100 * mean(equity), 1)), by = period][order(period)]
+tab_eq <- rbind(tab_eq,
+                data.table(period = "Total", alliances = nrow(sdc), equity_based = sum(sdc$equity),
+                           non_equity = sum(!sdc$equity),
+                           equity_share_pct = round(100 * mean(sdc$equity), 1)))
+knitr::kable(tab_eq, format.args = list(big.mark = ","),
+             caption = paste("Equity-based and non-equity alliances by period, definition:", equity_definition))
+
+# composition of the equity-based group (for the text of the data chapter, not for the table)
+cat("Equity-based alliances:", sum(sdc$equity),
+    "| of which joint venture flag:", sum(sdc$equity & sdc$jv_flag),
+    "| added by technique ET/CET only:", sum(sdc$equity & !sdc$jv_flag), "\n")
+```
+
+## 2. Selection criteria
+
+Two criteria (thesis 3.1): status *Completed/Signed* (pending alliances
+cannot be expected to influence subsequent growth) and exactly two
+participants (so that industry distance is unambiguous).
+
+```{r}
+#| label: filter
+status <- sdc[, .N, by = Status][order(-N)][, share := round(N / sum(N), 3)]
+knitr::kable(status, caption = "Alliance status in the raw extract")
+
+n_part <- sdc[, .N, by = `Number of Participants`][order(-N)][1:5]
+knitr::kable(n_part, caption = "Number of participants (top 5)")
+
+dy <- sdc[`Number of Participants` == "2" & Status == "Completed/Signed"]
+cat("Alliances in extract:", nrow(sdc), "\nAfter selection:     ", nrow(dy), "\n")
+```
+
+## 3. One row per participant
+
+```{r}
+#| label: split
+fields <- c(name    = "Participant Long Name",
+            cusip6  = "Participant 6-digit CUSIP",
+            nation  = "Participant Nation",
+            sic     = "Participant Primary SIC (Code)",
+            ps      = "Participant Public Status (Code)",
+            pp      = "Participant Ultimate Parent Public Status (Code)",
+            pname   = "Participant Ultimate Parent Name",
+            pnation = "Participant Ultimate Parent Nation",
+            pcusip6 = "Participant Ultimate Parent 6-digit CUSIP",
+            psic    = "Participant Ultimate Parent Primary SIC (Code)")
+
+get_side <- function(k) {
+  out <- dy[, .(deal = `Joint Venture/Alliance SDC Deal Number`, year,
+                jv = equity, side = k)]   # jv = equity-based alliance (see 1b)
+  for (f in names(fields)) {
+    parts <- tstrsplit(dy[[fields[f]]], ";", fixed = TRUE, fill = NA_character_)
+    out[, (f) := trimws(parts[[k]])]
+  }
+  out
+}
+
+tp <- rbind(get_side(1), get_side(2))
+tp[, id := .I]
+dim(tp)   # 318,970 = 159,485 alliances x 2 sides
+
+# every row also learns the SIC code (and listing status) of the OTHER partner
+other <- tp[, .(deal, side = 3L - side, partner_sic = sic, partner_ps = ps,
+                partner_pp = pp, partner_nation = nation)]
+tp <- other[tp, on = .(deal, side)]
+
+# sanity check: first alliance seen from both sides
+knitr::kable(tp[deal == tp$deal[1], .(side, name, sic, partner_sic)])
+```
+
+## 4. Alliance duration (justification of the three-year window, thesis 3.3.2)
+
+SDC rarely reports a termination date, so the duration of an alliance cannot
+be measured directly. The window length is therefore based on the literature
+(three years); the numbers below show that this is plausible for the data.
+
+```{r}
+#| label: duration
+sdc[, date_term := excel_date(`Date Terminated`)]
+cat("Share of alliances with a termination date:",
+    round(mean(!is.na(sdc$date_term)), 3), "\n")
+
+dur <- sdc[!is.na(date_term), .(years = as.numeric(date_term - date) / 365.25)]
+summary(dur$years)
+quantile(dur$years, 0.75)
+```
+
+## 5. Save
+
+```{r}
+#| label: save
+saveRDS(tp, file.path(path, "sdc_participants.rds"))
+saveRDS(list(all_alliances = nrow(sdc), kept_alliances = nrow(dy),
+             participants  = nrow(tp),
+             equity_definition = equity_definition,
+             equity_alliances  = sum(dy$equity), jv_flag_alliances = sum(dy$jv_flag)),
+        file.path(path, "sdc_counts.rds"))
+```

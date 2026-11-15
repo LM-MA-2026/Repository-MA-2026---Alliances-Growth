@@ -1,0 +1,348 @@
+---
+title: "Part 3 Linking alliances to firms and industry distance"
+subtitle: "Master thesis Sections 3.2 (linking) and 3.3.2 (distance)"
+author: "Lara Mazzarelli"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+---
+
+## Role in the pipeline
+
+| | |
+|---|---|
+| **Thesis section** | 3.2 (four-step matching), 3.3.2 (distance categories D0-D4) |
+| **Input** | `sdc_participants.rds` (file 1), `compustat_panel.rds` (file 2), Compustat identifier files |
+| **Output** | `alliances_focal.rds` (one row per alliance-firm observation), `firmyear_panel.rds` (panel + alliance counts), `link_counts.rds` (numbers for Table 2) |
+| **Previous / next file** | `02_firm_data.qmd` / `04_analysis_sample.qmd` |
+
+SDC and Compustat share no firm identifier. Participants are therefore matched
+in four consecutive steps (own CUSIP, parent CUSIP, exact name + country,
+fuzzy name). Matched alliances are then classified into the five SIC
+distance categories and aggregated to firm-year counts.
+
+```{r}
+#| label: setup
+source("00_config.R")
+library(stringdist)
+library(countrycode)
+
+tp    <- readRDS(file.path(path, "sdc_participants.rds"))
+panel <- readRDS(file.path(path, "compustat_panel.rds"))
+```
+
+## 1. Prepare the SDC side: country codes and company names
+
+```{r}
+#| label: prep-sdc
+# Align country names (SDC) with ISO codes (Compustat)
+to_iso <- function(x) {
+  fix <- c("Serbia and Montenegro" = "SRB", "Yugoslavia" = "SRB",
+           "German Democratic Republic" = "DEU", "Netherlands Antilles" = "ANT",
+           "Micronesia" = "FSM")
+  out <- countrycode(x, "country.name", "iso3c", warn = FALSE)
+  out[x %in% names(fix)] <- fix[x[x %in% names(fix)]]
+  out
+}
+nat <- unique(c(tp$nation, tp$pnation))
+nat_iso <- setNames(to_iso(nat), nat)
+tp[, `:=`(iso = nat_iso[nation], piso = nat_iso[pnation])]
+
+# Clean company names: upper case, no punctuation, no legal forms
+legal_forms <- paste0("\\b(INCORPORATED|INC|CORPORATION|CORP|CO|COMPANY|LTD|LIMITED|PLC|",
+                      "AG|SA|SE|NV|BV|GMBH|SPA|S P A|AB|ASA|OYJ|KK|LLC|LP|HOLDINGS?|HLDGS?|GROUP|GRP|",
+                      "THE|TBK|PT|BHD|BERHAD|PUBLIC|PCL|JSC|PJSC|OAO|SAB DE CV|DE CV|SAB|NPV|CL A|",
+                      "CLASS A|ADR)\\b")
+
+clean_name <- function(x) {
+  x <- toupper(ifelse(is.na(x), "", x))
+  x <- gsub("&", " AND ", x, fixed = TRUE)
+  x <- gsub("[^A-Z0-9 ]", " ", x)
+  x <- gsub(legal_forms, " ", x)
+  trimws(gsub("\\s+", " ", x))
+}
+tp[, `:=`(n_own = clean_name(name), n_parent = clean_name(pname))]
+knitr::kable(tp[1:5, .(name, n_own)])
+```
+
+## 2. Prepare the Compustat side: identifiers
+
+```{r}
+#| label: prep-cs
+data_key <- panel[!is.na(revt), paste(gvkey, fyear)]   # firm-years with revenue
+
+na_id <- unique(fread(file.path(path, "Compustat North America Data.csv"),
+                      select = c("gvkey", "cusip", "conm", "fic"),
+                      colClasses = list(character = c("gvkey", "cusip")),
+                      na.strings = c("", "NA")))
+na_id <- unique(na_id[!is.na(cusip), .(gvkey, cusip6 = substr(cusip, 1, 6), conm, country = fic)])
+
+gl_id <- unique(fread(file.path(path, "Compustat Global Data Start 1988.csv"),
+                      select = c("gvkey", "conm", "loc"),
+                      colClasses = list(character = "gvkey"),
+                      na.strings = c("", "NA"))[, .(gvkey, conm, country = loc)])
+
+names_cs <- unique(rbind(na_id[, .(gvkey, conm, country)], gl_id))
+names_cs[, n_clean := clean_name(conm)]
+names_cs <- unique(names_cs[nchar(n_clean) >= 3, .(gvkey, n_clean, country)])
+c(na_ids = nrow(na_id), global_ids = nrow(gl_id), names = nrow(names_cs))
+```
+
+## 3. Four-step matching
+
+The **order of the steps matters**: a participant is only matched in the
+first step that finds it. In case of doubt, no match is better than a wrong
+match: ambiguous candidates are discarded (`pick()`).
+
+```{r}
+#| label: match-functions
+tp[, `:=`(gvkey = NA_character_, route = NA_character_)]
+
+pick <- function(cand) {
+  cand <- unique(cand[, .(id, gvkey, year)])
+  cand[, n := .N, by = id]
+  cand[, has_data := paste(gvkey, year) %chin% data_key]
+  cand <- cand[n == 1 | has_data]
+  cand[, n2 := .N, by = id]
+  cand[n2 == 1, .(id, gvkey)]
+}
+
+assign_match <- function(hits, route_name) {
+  hits <- hits[!tp[!is.na(gvkey)], on = "id"]
+  tp[hits, on = "id", `:=`(gvkey = i.gvkey, route = route_name)]
+  cat(sprintf("  %-26s %7d\n", route_name, nrow(hits)))
+}
+unmatched <- function(cond) tp[is.na(gvkey) & eval(cond)]
+```
+
+```{r}
+#| label: match-exact
+cat("Matches by route:\n")
+
+# (1) own CUSIP
+k <- merge(unmatched(quote(ps == "P"))[, .(id, year, cusip6)], na_id[, .(cusip6, gvkey)],
+           by = "cusip6", allow.cartesian = TRUE)
+assign_match(pick(k), "NA CUSIP own")
+
+# (2) CUSIP of the ultimate parent
+k <- merge(unmatched(quote(pp == "P"))[, .(id, year, cusip6 = pcusip6)], na_id[, .(cusip6, gvkey)],
+           by = "cusip6", allow.cartesian = TRUE)
+assign_match(pick(k), "NA CUSIP parent")
+
+# (3) exact cleaned name + country, own name then parent name
+k <- merge(unmatched(quote(ps == "P"))[, .(id, year, n_clean = n_own, country = iso)], names_cs,
+           by = c("n_clean", "country"), allow.cartesian = TRUE)
+assign_match(pick(k), "Exact name own")
+
+k <- merge(unmatched(quote(pp == "P"))[, .(id, year, n_clean = n_parent, country = piso)], names_cs,
+           by = c("n_clean", "country"), allow.cartesian = TRUE)
+assign_match(pick(k), "Exact name parent")
+```
+
+```{r}
+#| label: match-fuzzy
+# (4) fuzzy name matching (Jaro-Winkler distance <= 0.05) with safeguards:
+# same country, same first letter, unique best candidate, plausible name pair
+plausible <- function(a, b, d) {
+  if (gsub(" ", "", a) == gsub(" ", "", b)) return(TRUE)
+  wa <- strsplit(a, " ")[[1]]; wb <- strsplit(b, " ")[[1]]
+  k <- min(length(wa), length(wb))
+  if (identical(wa[1:k], wb[1:k])) return(TRUE)
+  d <= 0.035 && wa[1] == wb[1]
+}
+
+fuzzy <- function(q, threshold = 0.05) {
+  q <- q[nchar(n_clean) >= 4 & !is.na(country)]
+  q[, block := paste(country, substr(n_clean, 1, 1))]
+  names_cs[, block := paste(country, substr(n_clean, 1, 1))]
+  res <- list()
+  for (b in unique(q$block)) {
+    qn <- unique(q[block == b, n_clean]); dn <- names_cs[block == b]
+    if (!nrow(dn)) next
+    dmat <- stringdistmatrix(qn, dn$n_clean, method = "jw", p = 0.1)
+    if (is.null(dim(dmat))) dmat <- matrix(dmat, nrow = length(qn))
+    best <- apply(dmat, 1, min)
+    for (i in which(best <= threshold)) {
+      g  <- unique(dn$gvkey[dmat[i, ] == best[i]])
+      cs <- dn$n_clean[which.min(dmat[i, ])]
+      if (length(g) == 1 && plausible(qn[i], cs, best[i])) res[[length(res) + 1]] <-
+        data.table(n_clean = qn[i], gvkey = g, cs_name = cs, dist = best[i])
+    }
+  }
+  if (!length(res)) return(data.table())
+  merge(q[, .(id, year, n_clean)], rbindlist(res), by = "n_clean")
+}
+
+f1 <- fuzzy(unmatched(quote(ps == "P"))[, .(id, year, n_clean = n_own, country = iso)])
+assign_match(pick(f1), "Fuzzy name own")        # about 1,800
+
+f2 <- fuzzy(unmatched(quote(pp == "P"))[, .(id, year, n_clean = n_parent, country = piso)])
+assign_match(pick(f2), "Fuzzy name parent")     # about 800
+```
+
+### Quality check of the fuzzy matches
+
+A random sample of 200 fuzzy matches was checked manually
+(`fuzzy_check_marked.xlsx`): 1 error in 149 distinct pairs (0.7%, 95% upper
+bound 3.2%). The error was a numbered shell company (GX ACQUISITION II
+matched to GX ACQUISITION).
+
+```{r}
+#| label: fuzzy-sample
+fz <- rbind(f1, f2)[tp[route %like% "Fuzzy", .(id, gvkey)], on = .(id, gvkey), nomatch = 0]
+set.seed(42)
+fwrite(unique(fz[sample(.N, min(200, .N)), .(sdc_name = n_clean, compustat_name = cs_name, dist)]),
+       file.path(path, "fuzzy_check_sample.csv"))
+```
+
+### Match rate
+
+Only listed firms (own or parent) can be matched to Compustat, so the match
+rate is evaluated for those participants.
+
+```{r}
+#| label: match-rate
+tp[, listed_link := ps == "P" | pp == "P"]
+cat("Listed-linked partners matched:", round(tp[listed_link == TRUE, mean(!is.na(gvkey))], 3), "\n")
+
+knitr::kable(
+  tp[listed_link == TRUE, .(matched = round(mean(!is.na(gvkey)), 3)),
+     by = .(decade = (year %/% 10) * 10)][order(decade)],
+  caption = "Match rate of listed-linked partners by decade")
+# 1980s 64.4% -> 2020s 81.1%: older firms are renamed or delisted more often
+```
+
+## 4. Focal-firm observations
+
+Each matched participant is treated as a focal firm in its own observation.
+Alliances between affiliates of the same parent company are removed.
+
+```{r}
+#| label: focal
+af <- tp[!is.na(gvkey)]
+n_matched <- nrow(af)
+
+# drop intra-group alliances (e.g. parent and subsidiary)
+partner_gv <- af[, .(deal, side = 3L - side, partner_gvkey = gvkey)]
+af <- partner_gv[af, on = .(deal, side)]
+af <- af[is.na(partner_gvkey) | partner_gvkey != gvkey]
+n_after_affiliates <- nrow(af)
+c(matched = n_matched, after_affiliates = n_after_affiliates,
+  removed = n_matched - n_after_affiliates)
+```
+
+The focal firm's industry comes from Compustat's **historical SIC code**
+(`sich`, filled within firm in file 2), looked up in the alliance year
+(or the closest year within +/-2). Firms without any historical Compustat SIC
+are excluded instead of falling back on the SDC code.
+The partner's industry is the SDC code of the partner.
+
+```{r}
+#| label: focal-sic
+sich_tab <- panel[!is.na(sich_fill), .(gvkey, fyear, sich = sich_fill)]
+af[, fyear := year]
+af[, focal_sic := NA_character_]
+for (off in c(0, -1, 1, -2, 2)) {
+  s <- copy(sich_tab)[, fyear := fyear - off]
+  af[is.na(focal_sic), focal_sic := s[.SD, on = .(gvkey, fyear), x.sich]]
+}
+af <- af[!is.na(focal_sic)]                           # no Compustat SIC in any year -> excluded
+af <- af[nchar(focal_sic) == 4 & nchar(partner_sic) == 4]   # both codes need four digits
+n_final <- nrow(af)
+c(after_affiliates = n_after_affiliates, final = n_final)   # final: 108,295
+```
+
+## 5. Industry distance categories D0-D4 (thesis 3.3.2)
+
+`fcase()` is a chain of if-else conditions, and the first match wins: a pair
+sharing all four digits becomes D0 and never reaches the later tests; a pair
+sharing only the first two digits falls through D0 and D1 and lands in D2.
+Related alliances are D0-D3, the unrelated alliance is D4 (different SIC
+division).
+
+```{r}
+#| label: distance
+sic_division <- function(s) {
+  x <- as.integer(substr(s, 1, 2))
+  cut(x, c(-1, 9, 14, 17, 39, 49, 51, 59, 67, 89, 99),
+      labels = c("A", "B", "C", "D", "E", "F", "G", "H", "I", "J"))
+}
+
+af[, category := fcase(
+  focal_sic == partner_sic,                               "d0_same4",
+  substr(focal_sic, 1, 3) == substr(partner_sic, 1, 3),   "d1_same3",
+  substr(focal_sic, 1, 2) == substr(partner_sic, 1, 2),   "d2_same2",
+  sic_division(focal_sic) == sic_division(partner_sic),   "d3_same_division",
+  default =                                               "d4_diff_division")]
+
+dist_tab <- af[, .N, by = category][order(category)][, share := round(N / sum(N), 3)]
+knitr::kable(dist_tab, caption = "Alliance-firm observations by distance category (before sample restriction)")
+# about half of all alliances are cross-division (D4)
+```
+
+```{r}
+#| label: save-focal
+saveRDS(af[, .(deal, year, gvkey, route, jv, focal_sic, partner_sic,
+               partner_ps, partner_pp, partner_nation, partner_gvkey, category)],
+        file.path(path, "alliances_focal.rds"))
+
+saveRDS(list(participants = nrow(tp), matched = n_matched,
+             after_affiliates = n_after_affiliates, final = n_final),
+        file.path(path, "link_counts.rds"))
+```
+
+## 6. Aggregate to firm-year counts
+
+For every firm-year: the number of alliances of each distance category,
+split by governance form (`_eq` = equity-based, `_ne` = non-equity; `jv` is the equity-based indicator from file 1).
+
+```{r}
+#| label: aggregate
+af[, gov := fifelse(jv, "eq", "ne")]
+counts <- dcast(af, gvkey + year ~ category + gov,
+                fun.aggregate = length, value.var = "deal")
+# n_jv = number of equity-based alliances (variable name kept from the first version)
+jv_c   <- af[, .(n_jv = sum(jv), n_alliances = .N), by = .(gvkey, year)]
+counts <- jv_c[counts, on = .(gvkey, year)]
+setnames(counts, "year", "fyear")
+
+fp <- counts[panel, on = .(gvkey, fyear)]
+cnt_cols <- setdiff(names(counts), c("gvkey", "fyear"))
+fp[, (cnt_cols) := lapply(.SD, nafill, fill = 0), .SDcols = cnt_cols]
+fp[, ever_alliance := any(n_alliances > 0), by = gvkey]
+
+stopifnot(nrow(fp) == nrow(panel))
+c(firm_years = nrow(fp), alliances_in_panel = sum(fp$n_alliances), alliances_linked = n_final)
+```
+
+### Alliances that do not land in the panel
+
+Roughly 11,700 of the 108,295 alliance-firm observations cannot be placed in
+the panel: about 8,400 are announced after 2024 (SDC runs longer than
+Compustat) and about 3,300 fall into firm-years that are missing in
+Compustat. None of them is usable anyway, because without a Compustat
+firm-year there is no growth rate and no controls.
+
+```{r}
+#| label: lost
+lost <- counts[!panel, on = .(gvkey, fyear)]
+knitr::kable(
+  lost[, .(alliances = sum(n_alliances)),
+       by = .(reason = fcase(fyear > 2024, "after 2024",
+                             !gvkey %chin% panel$gvkey, "firm not in panel",
+                             default = "firm in panel, year missing"))],
+  caption = paste("Alliances not in the panel, total:", sum(lost$n_alliances)))
+```
+
+```{r}
+#| label: save-panel
+saveRDS(fp, file.path(path, "firmyear_panel.rds"))
+```

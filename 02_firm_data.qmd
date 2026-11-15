@@ -1,0 +1,220 @@
+---
+title: "Part 2 Firm data (Compustat)"
+subtitle: "Master thesis Section 3.2"
+author: "Lara Mazzarelli"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+---
+
+## Role in the pipeline
+
+| | |
+|---|---|
+| **Thesis section** | 3.2 Firm data and analysis sample (panel construction) |
+| **Input** | `Compustat North America Data.csv`, `Compustat Global Data Start 1988.csv`, `exchange_rates.csv` |
+| **Output** | `compustat_panel.rds` (firm-year panel, 1988-2024) |
+| **Previous / next file** | `01_alliance_data.qmd` / `03_linking_and_distance.qmd` |
+
+This file builds the firm-year panel from Compustat North America and
+Compustat Global: it stacks the two sources, defines revenue growth and the
+control variables, fills the historical SIC code (`sich`) and converts
+assets and revenue to USD.
+
+```{r}
+#| label: setup
+source("00_config.R")
+```
+
+## 1. Read the raw files
+
+`colClasses` keeps identifiers and SIC codes as text, so that they are not
+altered (e.g. leading zeros).
+
+```{r}
+#| label: read
+na <- fread(file.path(path, "Compustat North America Data.csv"),
+            colClasses = list(character = c("gvkey", "sich", "naicsh", "cusip")),
+            na.strings = c("", "NA"))
+gl <- fread(file.path(path, "Compustat Global Data Start 1988.csv"),
+            colClasses = list(character = c("gvkey", "sich", "naicsh", "isin", "sedol")),
+            na.strings = c("", "NA"))
+
+dim(na)   # 607,056 rows, 17 columns
+dim(gl)   # 832,840 rows, 19 columns
+
+knitr::kable(na[, .N, by = indfmt], caption = "North America: INDL vs. FS duplicates")
+```
+
+## 2. Clean both sources
+
+```{r}
+#| label: clean
+# -- North America --
+na <- na[indfmt == "INDL"]                 # drops financial-services duplicates
+na <- na[fyear >= 1988 & fyear <= 2024]    # same window as Global (starts 1988)
+na <- na[!(is.na(at) & is.na(lt) & is.na(revt) & is.na(sale) & is.na(ni))]   # empty rows
+
+# -- Global -- (the INDL/FS duplicates do not exist in this download)
+gl <- gl[fyear >= 1988 & fyear <= 2024]
+gl <- gl[!(is.na(at) & is.na(lt) & is.na(revt) & is.na(sale) & is.na(nicon))]
+
+c(north_america = nrow(na), global = nrow(gl))
+
+# harmonise the two sources
+setnames(na, "ni", "nicon")
+na[, `:=`(source = "NA", country = fic, isin = NA_character_,
+          sedol = NA_character_, cusip6 = substr(cusip, 1, 6))]
+gl[, `:=`(source = "Global", country = loc,
+          cusip = NA_character_, cusip6 = NA_character_)]
+```
+
+## 3. One observation per firm-year, stack the sources
+
+Within each source only one record per firm-year is kept (the one with the
+highest revenue), and North America records that also exist in Global are
+dropped.
+
+```{r}
+#| label: stack
+dedup <- function(d) {
+  setorder(d, gvkey, fyear, -revt, na.last = TRUE)
+  unique(d, by = c("gvkey", "fyear"))
+}
+na <- dedup(na)
+gl <- dedup(gl)
+
+na <- na[!gl, on = .(gvkey, fyear)]   # keep NA rows that are not in Global
+
+cols <- c("gvkey", "fyear", "conm", "source", "country", "fic", "cusip", "cusip6",
+          "isin", "sedol", "curcd", "costat", "at", "lt", "revt", "sale",
+          "nicon", "sich", "naicsh")
+
+panel <- rbind(na[, ..cols], gl[, ..cols])
+stopifnot(!anyDuplicated(panel, by = c("gvkey", "fyear")))   # every firm-year only once
+dim(panel)   # about 1.12 million firm-years
+```
+
+## 4. Revenue growth (raw)
+
+One-year growth is only defined if the previous year exists without a gap,
+the currency did not change, and the previous revenue is positive.
+The forward growth rates of the dependent variable (t to t+3, t to t+1)
+are built from these revenues in `04_analysis_sample.qmd`.
+
+```{r}
+#| label: growth
+setorder(panel, gvkey, fyear)
+
+panel[, `:=`(revt_lag  = shift(revt),
+             fyear_lag = shift(fyear),
+             curcd_lag = shift(curcd)), by = gvkey]
+
+panel[, growth := fifelse(fyear_lag == fyear - 1 & curcd_lag == curcd & revt_lag > 0,
+                          (revt - revt_lag) / revt_lag, NA_real_)]
+
+# Why growth is missing (first year of firm, gap, currency switch, zero revenue)
+knitr::kable(
+  panel[is.na(growth), .(
+    first_year_of_firm = sum(is.na(fyear_lag)),
+    gap_in_series      = sum(!is.na(fyear_lag) & fyear_lag != fyear - 1),
+    currency_change    = sum(!is.na(fyear_lag) & fyear_lag == fyear - 1 & curcd_lag != curcd, na.rm = TRUE),
+    revenue_zero       = sum(!is.na(fyear_lag) & fyear_lag == fyear - 1 & revt_lag <= 0, na.rm = TRUE))],
+  caption = "Firm-years without a one-year growth rate")
+
+# The raw distribution has absurd extremes -> reason for winsorising later
+quantile(panel$growth, c(0, 0.01, 0.25, 0.5, 0.75, 0.99, 1), na.rm = TRUE)
+
+# Sanity check on a known firm
+panel[conm %like% "APPLE INC", .(fyear, revt, growth = round(growth, 3))][fyear %in% 2015:2020]
+```
+
+## 5. Control variables (raw)
+
+Past growth is the one-year growth of the *previous* year (t-2 to t-1);
+all other controls are measured in year t.
+
+```{r}
+#| label: controls
+panel[, `:=`(roa         = fifelse(at > 0, nicon / at, NA_real_),
+             leverage    = fifelse(at > 0, lt / at,    NA_real_),
+             ln_at_local = fifelse(at > 0, log(pmax(at, 1e-9)), NA_real_))]
+
+panel[, `:=`(roa_l1      = fifelse(fyear_lag == fyear - 1, shift(roa),      NA_real_),
+             leverage_l1 = fifelse(fyear_lag == fyear - 1, shift(leverage), NA_real_),
+             growth_l1   = fifelse(fyear_lag == fyear - 1, shift(growth),   NA_real_)),
+      by = gvkey]
+
+# Firm age is NOT used in the models (collinear with firm and year FE, thesis 3.3.4)
+panel[, age := fyear - min(fyear), by = gvkey]
+```
+
+## 6. Historical SIC code
+
+`sich` is missing for 13.5% of firm-years. Firms rarely change industry, so
+gaps are filled from the same firm's nearest earlier year, otherwise the
+nearest later year. Firms without any `sich` stay missing and drop out of
+the sample (2.8% of firm-years). The header SIC is deliberately not used,
+because it reflects today's industry (Kahle & Walkling, 1996).
+
+```{r}
+#| label: sic
+setorder(panel, gvkey, fyear)
+panel[, sich_n := as.integer(as.character(sich))]
+panel[, sich_fill_n := nafill(nafill(sich_n, "locf"), "nocb"), by = gvkey]
+panel[, sic_origin := fcase(!is.na(sich_n),      "historical",
+                            !is.na(sich_fill_n), "filled",
+                            default = NA_character_)]
+panel[, sich_fill := fifelse(is.na(sich_fill_n), NA_character_,
+                             sprintf("%04d", sich_fill_n))]
+panel[, sic2 := substr(sich_fill, 1, 2)]
+panel[, financial := (sich_fill_n %/% 100) %between% c(60, 69)]
+panel[, c("sich_n", "sich_fill_n") := NULL]
+
+knitr::kable(panel[, .N, by = sic_origin][, share := round(N / sum(N), 3)],
+             caption = "Origin of the SIC code")
+```
+
+## 7. Currency conversion to USD
+
+Assets are a balance-sheet figure and use the year-end rate; revenue accrues
+over the year and uses the annual average rate. The rates are calendar-year
+rates, whereas `fyear` does not always end in December.
+
+```{r}
+#| label: fx
+fx <- fread(file.path(path, "exchange_rates.csv"))
+fx[, year := year(as.Date(datadate))]
+setorder(fx, curd, datadate)
+
+fx_end <- fx[!is.na(exratd_tousd), .SD[.N], by = .(curd, year), .SDcols = "exratd_tousd"]
+setnames(fx_end, "exratd_tousd", "fx_end")
+fx_avg <- fx[!is.na(exratd_tousd), .(fx_avg = mean(exratd_tousd)), by = .(curd, year)]
+
+panel[fx_end, on = .(curcd = curd, fyear = year), fx_end := i.fx_end]
+panel[fx_avg, on = .(curcd = curd, fyear = year), fx_avg := i.fx_avg]
+panel[curcd == "USD", `:=`(fx_end = 1, fx_avg = 1)]
+
+panel[, `:=`(at_usd = at * fx_end, revt_usd = revt * fx_avg)]
+panel[, ln_at_usd := fifelse(at_usd > 0, log(at_usd), NA_real_)]
+setorder(panel, gvkey, fyear)
+panel[, revt_usd_lag := fifelse(fyear_lag == fyear - 1, shift(revt_usd), NA_real_), by = gvkey]
+
+knitr::kable(panel[, .(share_missing_fx = round(mean(is.na(fx_end)), 3)), by = source],
+             caption = "Firm-years without an exchange rate")
+```
+
+## 8. Save
+
+```{r}
+#| label: save
+saveRDS(panel, file.path(path, "compustat_panel.rds"))
+```

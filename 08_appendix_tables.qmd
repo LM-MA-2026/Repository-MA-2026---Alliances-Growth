@@ -1,0 +1,665 @@
+---
+title: "Part 8 Appendix tables and figures"
+subtitle: "Master thesis Appendix (sample description, full regression results, supplementary figures)"
+author: "Lara Mazzarelli"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+---
+
+## Role in the pipeline
+
+| | |
+|---|---|
+| **Thesis section** | Appendix (no narrative text in the appendix itself -- tables and figures only) |
+| **Input** | `analysis_sample.rds`, `firmyear_panel.rds`, `alliances_focal.rds` (files 1/3/4) |
+| **Output** | every `table_appx_*.csv` and `fig_appx_*.png` in `appendix_out_v2/` |
+| **Previous file** | `07_additional_robustness_checks.qmd` |
+
+This file replaces the appendix tables that were originally typed up by hand
+from numbers in various CSVs, and the loose R script that produced the R10
+coefficient figure. Every table and figure below is built here from the saved
+`.rds` files, with the same helper functions, labels and fixed effects as
+files 06 and 07. Knit it, then pull the tables/figures from
+`appendix_out_v2/` into the Word appendix.
+
+**Numbering.** Files 06 and 07 used different internal numbers for the same
+robustness check at different points while the thesis text was being drafted
+(e.g. the "US firms" split was called R11, R15 and other things). The list
+below is the numbering **as it stands in the current thesis text (Table
+11)**, confirmed against the thesis's own Figure 8 panel labels. Use this
+list, not a chunk or object name elsewhere:
+
+| Final label | What it is | Filter / change vs. main specification |
+|---|---|---|
+| R1 | without country x year FE | `fe` drops `country^fyear` |
+| R2 | without industry x year FE | `fe` drops `sic2^fyear` |
+| R3 | without firm FE | `fe` drops `gvkey` |
+| R4 | without control variables | `ctrl = NULL` |
+| R5 | firm-specific linear trend | `fe` adds `gvkey[t_c]` |
+| R6 | one-year growth horizon | `y = "growth_f1_w"` |
+| R7 | alliance window (year t / 2y / 4y / 5y) | alliance counts use a different window suffix |
+| R8 | placebo: growth t-6 to t-3 | `y` = placebo growth, no `growth_l1_w` control |
+| R9 | excluding SDC coverage gap 2009-2015 | `data = d[!(fyear %between% c(2009, 2015))]` |
+| R10 | revenue floor: USD 20m / no floor | `data = d[revt_usd_lag >= 20]` or `d_nofloor` |
+| R11 | United States / non-United States firms | `data = d[country == "USA"]` / `d[country != "USA"]` |
+| R12 | below- / above-median firm size | `data = d[ln_at_usd <= med_size]` / `d[ln_at_usd > med_size]` |
+
+## Setup
+
+```{r}
+#| label: setup
+source("00_config.R")
+library(data.table)
+library(fixest)
+library(ggplot2)
+library(patchwork)
+library(countrycode)
+library(scales)
+
+out <- file.path(path, "appendix_out_v2")
+# Wipe and recreate on every knit, rather than just adding to it. We've renamed
+# and dropped several tables/figures across revisions of this file, and fwrite()/
+# ggsave() only ever add or overwrite -- they never delete a file an earlier
+# version of this script wrote but the current one doesn't. Without this, the
+# folder silently accumulates stale leftovers (old filenames, cut sections)
+# alongside the current ones, which is exactly the trap appendix_out/ (the
+# pre-this-file folder) fell into.
+unlink(out, recursive = TRUE)
+dir.create(out)
+
+d  <- readRDS(file.path(path, "analysis_sample.rds"))
+fp <- readRDS(file.path(path, "firmyear_panel.rds"))
+af <- readRDS(file.path(path, "alliances_focal.rds"))
+d[, sic2 := as.factor(sic2)]
+
+# alliance-firm observations inside the analysis sample (same construction as 05)
+af_s <- af[d[, .(gvkey, fyear)], on = .(gvkey, year = fyear), nomatch = 0]
+
+c(firm_years = nrow(d), firms = uniqueN(d$gvkey), countries = uniqueN(d$country),
+  alliance_firm_obs = nrow(af_s))
+```
+
+```{r}
+#| label: helpers
+wins <- function(x, p = 0.01) {
+  q <- quantile(x, c(p, 1 - p), na.rm = TRUE)
+  pmin(pmax(x, q[1]), q[2])
+}
+diff_test <- function(m, a, b) {
+  v   <- vcov(m)
+  est <- coef(m)[[a]] - coef(m)[[b]]
+  se  <- sqrt(v[a, a] + v[b, b] - 2 * v[a, b])
+  c(est = est, se = se, t = est / se, p = 2 * pnorm(-abs(est / se)))
+}
+joint_p <- function(m, pattern = "^log1p\\(d") wald(m, keep = pattern, print = FALSE)$p
+omnibus_p <- function(m, pattern = "^log1p\\(d") {
+  nm <- grep(pattern, names(coef(m)), value = TRUE)
+  R <- matrix(0, nrow = 4, ncol = 5)
+  for (i in 1:4) { R[i, i] <- 1; R[i, i + 1] <- -1 }
+  rb   <- R %*% coef(m)[nm]
+  stat <- as.numeric(t(rb) %*% solve(R %*% vcov(m)[nm, nm] %*% t(R)) %*% rb)
+  pchisq(stat, df = 4, lower.tail = FALSE)
+}
+
+controls <- "ln_at_usd + roa_w + leverage_w + growth_l1_w"
+fe_main  <- "gvkey + sic2^fyear + country^fyear"
+
+est <- function(rhs, fe = fe_main, y = "growth_f3_w", data = d, ctrl = controls) {
+  rhs_all <- if (is.null(ctrl)) rhs else paste(rhs, "+", ctrl)
+  feols(as.formula(paste0(y, " ~ ", rhs_all, " | ", fe)), data = data, cluster = ~gvkey)
+}
+
+rhs_h1   <- "log1p(n_rel_3y) + log1p(n_unrel_3y)"
+rhs_dist <- function(suffix) paste0("log1p(", cats, suffix, ")", collapse = " + ")
+rhs_h2   <- rhs_dist("_3y")
+rhs_h3   <- paste("log1p(n_rel_eq_3y) + log1p(n_rel_ne_3y)",
+                  "log1p(n_unrel_eq_3y) + log1p(n_unrel_ne_3y)", sep = " + ")
+rhs_h4   <- paste0(c(rbind(paste0("log1p(", cats, "_eq_3y)"), paste0("log1p(", cats, "_ne_3y)"))),
+                   collapse = " + ")
+
+# exact row labels as they appear in the thesis (Tables 1, 8-11)
+cat_labels_paper <- c(d0_same4 = "D0 (same four-digit SIC)", d1_same3 = "D1 (same three-digit SIC)",
+                      d2_same2 = "D2 (same major group)", d3_same_division = "D3 (same SIC division)",
+                      d4_diff_division = "D4 (different SIC division)")
+
+# The "no revenue floor" version of the sample (same filters as the main sample,
+# minus the revt_usd_lag >= 10 step) -- needed both for the R10 robustness model
+# (Appendix B) and to show, descriptively, what the revenue floor is cutting
+# (Appendix A, Figure A8). Rebuilt from the raw panel because the alliance-window
+# variables have to be recomputed before the floor is applied (see 07, Panel E).
+fp_raw <- copy(fp)
+fp_raw[, fyear3 := fyear + 3L]
+fp_raw[fp_raw, on = .(gvkey, fyear3 = fyear), `:=`(revt_f3 = i.revt, curcd_f3 = i.curcd)]
+fp_raw[, growth_f3 := fifelse(revt > 0 & revt_f3 > 0 & curcd == curcd_f3, (revt_f3 / revt)^(1/3) - 1, NA_real_)]
+fp_raw[, `:=`(growth_f3_w = wins(growth_f3), growth_l1_w = wins(growth_l1), roa_w = wins(roa), leverage_w = wins(leverage))]
+for (k in cats) fp_raw[, (k) := get(paste0(k, "_eq")) + get(paste0(k, "_ne"))]
+setorder(fp_raw, gvkey, fyear)
+fp_raw[, `:=`(fy_m1 = fyear - 1L, fy_m2 = fyear - 2L)]
+for (v in cats) {
+  src <- fp_raw[, .(gvkey, fyear, val = get(v))]
+  fp_raw[src, on = .(gvkey, fy_m1 = fyear), m1 := i.val]
+  fp_raw[src, on = .(gvkey, fy_m2 = fyear), m2 := i.val]
+  fp_raw[, (paste0(v, "_3y")) := get(v) + fcoalesce(m1, 0L) + fcoalesce(m2, 0L)]
+  fp_raw[, c("m1", "m2") := NULL]
+}
+d_nofloor <- fp_raw[!(financial %in% TRUE)]
+d_nofloor <- d_nofloor[!is.na(sic2) & !(as.integer(as.character(sic2)) %in% c(49, 99))]
+d_nofloor <- d_nofloor[!is.na(growth_f3_w) & !is.na(ln_at_usd) & !is.na(roa) & !is.na(leverage) & !is.na(growth_l1)]
+d_nofloor[, sic2 := as.factor(sic2)]
+cat("no-floor sample:", nrow(d_nofloor), " | main sample (floor = USD 10m):", nrow(d), "\n")
+```
+
+# Appendix A: Sample Description
+
+This section describes the analysis sample by country, region, firm size and
+time -- none of it is regression output, so none of it can be "wrong" in the
+way a mis-specified model can be, but it is exactly the material an examiner
+checks first when a thesis claims a result holds "mainly for US firms" or
+"mainly for smaller firms" (sections 5.1.1 and 5.3).
+
+## A1. Firm-years and firms by country
+
+```{r}
+#| label: appx-a1-country
+by_country <- d[, .(firm_years = .N, firms = uniqueN(gvkey)), by = country][order(-firm_years)]
+by_country[, `:=`(share_firm_years_pct = round(100 * firm_years / sum(firm_years), 1))]
+
+top_n <- 15
+tabA1 <- rbind(
+  by_country[1:top_n],
+  by_country[(top_n + 1):.N, .(country = "Other", firm_years = sum(firm_years),
+                                firms = sum(firms), share_firm_years_pct = round(100 * sum(firm_years) / sum(by_country$firm_years), 1))])
+knitr::kable(tabA1, format.args = list(big.mark = ","),
+             caption = "Table A1: Firm-years and firms by country (top 15, Compustat country of incorporation/location)")
+fwrite(tabA1, file.path(out, "table_appx_A1_country.csv"))
+fwrite(by_country, file.path(out, "table_appx_A1_country_full.csv"))  # ungrouped, for your own checking
+
+p_A1 <- ggplot(tabA1[country != "Other"], aes(x = reorder(country, firm_years), y = firm_years)) +
+  geom_col(fill = "grey25", width = 0.7) +
+  coord_flip() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = NULL, y = "Firm-years", title = "Figure A1: Firm-years by country (top 15)") +
+  theme_thesis()
+p_A1
+ggsave(file.path(out, "fig_appx_A1_country.png"), p_A1, width = 7, height = 5, dpi = 300)
+```
+
+## A2. Firm-years and firms by region
+
+`country` codes come from Compustat (`fic` for North America, `loc` for
+Global). They map onto `countrycode`'s ISO3c almost completely; any that do
+not are printed below so you can patch `fix_region` rather than silently
+dropping firms into "Unmapped".
+
+```{r}
+#| label: appx-a2-region
+fix_region <- c(ANT = "Caribbean")  # Netherlands Antilles (dissolved 2010); not in countrycode's iso3c table
+region_map <- countrycode(unique(d$country), origin = "iso3c", destination = "region23", warn = FALSE)
+names(region_map) <- unique(d$country)
+unmapped <- names(region_map)[is.na(region_map)]
+if (length(unmapped) > 0) cat("Unmapped country codes (add to fix_region if frequent):\n",
+                              paste(unmapped, collapse = ", "), "\n")
+region_map[names(fix_region)] <- fix_region
+
+d[, region := region_map[country]]
+d[is.na(region), region := "Unmapped"]
+
+by_region <- d[, .(firm_years = .N, firms = uniqueN(gvkey), countries = uniqueN(country)), by = region][order(-firm_years)]
+by_region[, share_pct := round(100 * firm_years / sum(firm_years), 1)]
+knitr::kable(by_region, format.args = list(big.mark = ","),
+             caption = "Table A2: Firm-years, firms and countries by region")
+fwrite(by_region, file.path(out, "table_appx_A2_region.csv"))
+
+p_A2 <- ggplot(by_region, aes(x = reorder(region, firm_years), y = firm_years)) +
+  geom_col(fill = "grey25", width = 0.7) + coord_flip() +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = NULL, y = "Firm-years", title = "Figure A2: Firm-years by region") +
+  theme_thesis()
+p_A2
+ggsave(file.path(out, "fig_appx_A2_region.png"), p_A2, width = 7, height = 4.5, dpi = 300)
+```
+
+## A3. Distance categories by firm location (United States vs. rest of sample) -- underlies R11
+
+Directly supports section 5.1.1's claim that H1 is driven by United States firms.
+
+```{r}
+#| label: appx-a3-us-split
+af_s[, cat_label := factor(cat_labels_paper[category], levels = cat_labels_paper)]
+af_s[d, on = .(gvkey, year = fyear), `:=`(us_firm = i.country == "USA", region = i.region)]
+
+tabA3 <- af_s[, .N, by = .(us_firm, cat_label)]
+tabA3[, share := round(100 * N / sum(N), 1), by = us_firm]
+tabA3_wide <- dcast(tabA3, cat_label ~ us_firm, value.var = c("N", "share"))
+setnames(tabA3_wide, c("cat_label", "N_FALSE", "N_TRUE", "share_FALSE", "share_TRUE"),
+         c("Distance category", "Obs. (non-US)", "Obs. (US)", "Share % (non-US)", "Share % (US)"))
+knitr::kable(tabA3_wide, format.args = list(big.mark = ","),
+             caption = "Table A3: Alliance-firm observations by distance category, United States vs. rest of sample (underlies R11)")
+fwrite(tabA3_wide, file.path(out, "table_appx_A3_us_split.csv"))
+
+# how many firm-years / firms does each side of the R11 split actually have?
+d[, .(firm_years = .N, firms = uniqueN(gvkey)), by = .(us_firm = country == "USA")]
+```
+
+## A4. Distance categories by firm size (below- / above-median) -- underlies R12
+
+```{r}
+#| label: appx-a4-size-split
+med_size <- median(d$ln_at_usd, na.rm = TRUE)
+af_s[d, on = .(gvkey, year = fyear), below_median := i.ln_at_usd <= med_size]
+
+tabA4 <- af_s[, .N, by = .(below_median, cat_label)]
+tabA4[, share := round(100 * N / sum(N), 1), by = below_median]
+tabA4_wide <- dcast(tabA4, cat_label ~ below_median, value.var = c("N", "share"))
+setnames(tabA4_wide, c("cat_label", "N_FALSE", "N_TRUE", "share_FALSE", "share_TRUE"),
+         c("Distance category", "Obs. (above median)", "Obs. (below median)",
+           "Share % (above median)", "Share % (below median)"))
+knitr::kable(tabA4_wide, format.args = list(big.mark = ","),
+             caption = "Table A4: Alliance-firm observations by distance category, below- vs. above-median firm size (underlies R12)")
+fwrite(tabA4_wide, file.path(out, "table_appx_A4_size_split.csv"))
+
+d[, .(firm_years = .N, firms = uniqueN(gvkey), median_size_usd_m = round(exp(med_size), 0)),
+  by = .(below_median = ln_at_usd <= med_size)]
+```
+
+## A5. Summary statistics by region and by size group
+
+```{r}
+#| label: appx-a5-summary-by-split
+sum_vars <- c(growth_f3_w = "Revenue growth, g (t to t+3)", ln_at_usd = "Size (ln total assets, USD)",
+              roa_w = "ROA", leverage_w = "Leverage", n_alliances_3y = "All alliances")
+
+summarise_by <- function(byvar) {
+  rbindlist(lapply(names(sum_vars), function(v) {
+    d[, .(variable = sum_vars[[v]], mean = round(mean(get(v)), 3),
+          median = round(median(get(v)), 3), sd = round(sd(get(v)), 3), N = .N),
+      by = byvar]
+  }))
+}
+
+tabA5a <- summarise_by("region")
+knitr::kable(tabA5a, caption = "Table A5a: Summary statistics by region")
+fwrite(tabA5a, file.path(out, "table_appx_A5a_by_region.csv"))
+
+d[, size_group := fifelse(ln_at_usd <= med_size, "Below median", "Above median")]
+tabA5b <- summarise_by("size_group")
+knitr::kable(tabA5b, caption = "Table A5b: Summary statistics by size group")
+fwrite(tabA5b, file.path(out, "table_appx_A5b_by_size.csv"))
+```
+
+## A6. Panel structure: years observed per firm
+
+```{r}
+#| label: appx-a6-panel-structure
+yrs_per_firm <- d[, .N, by = gvkey]
+tabA6 <- data.table(statistic = c("Mean", "Median", "Min", "Max", "Firms with 1 year only", "Firms observed every year (32)"),
+                    value = c(round(mean(yrs_per_firm$N), 2), median(yrs_per_firm$N), min(yrs_per_firm$N),
+                              max(yrs_per_firm$N), sum(yrs_per_firm$N == 1), sum(yrs_per_firm$N == uniqueN(d$fyear))))
+knitr::kable(tabA6, caption = "Table A6: Panel structure -- years observed per firm")
+fwrite(tabA6, file.path(out, "table_appx_A6_panel_structure.csv"))
+
+p_A6 <- ggplot(yrs_per_firm, aes(x = N)) +
+  geom_histogram(binwidth = 1, fill = "grey25", colour = "white") +
+  labs(x = "Years observed", y = "Number of firms", title = "Figure A6: Distribution of years observed per firm") +
+  theme_thesis()
+p_A6
+ggsave(file.path(out, "fig_appx_A6_panel_structure.png"), p_A6, width = 6, height = 4, dpi = 300)
+```
+
+## A7. Firm-years by year, and number of distinct firms/countries per year
+
+Complements Figure 5 (which counts alliances, not firm-years) and gives the
+full year range rather than the 2006-2018 excerpt in section 5.1.1's SDC-gap discussion.
+
+```{r}
+#| label: appx-a7-by-year
+tabA7 <- d[, .(firm_years = .N, firms = uniqueN(gvkey), countries = uniqueN(country)), by = fyear][order(fyear)]
+knitr::kable(tabA7, format.args = list(big.mark = ","), caption = "Table A7: Firm-years, firms and countries by year")
+fwrite(tabA7, file.path(out, "table_appx_A7_by_year.csv"))
+
+# No SDC-gap shading here: these are Compustat firm-years, which is not the
+# series that has a 2009-2015 coverage gap (that gap is in the SDC alliance
+# data -- see the main text's discussion of SDC coverage). Shading it here
+# would just invite the reader to look for a dip that isn't there.
+p_A7a <- ggplot(tabA7, aes(x = fyear, y = firm_years)) +
+  geom_line(colour = "black", linewidth = 0.6) +
+  scale_x_continuous(breaks = seq(1990, 2020, 5)) + scale_y_continuous(labels = scales::comma) +
+  labs(x = "Year", y = "Firm-years", title = "(a) Firm-years per year") + theme_thesis()
+p_A7b <- ggplot(tabA7, aes(x = fyear, y = countries)) +
+  geom_line(colour = "black", linewidth = 0.6) +
+  scale_x_continuous(breaks = seq(1990, 2020, 5)) +
+  labs(x = "Year", y = "Distinct countries", title = "(b) Country coverage per year") + theme_thesis()
+fig_A7 <- p_A7a + p_A7b
+fig_A7
+ggsave(file.path(out, "fig_appx_A7_by_year.png"), fig_A7, width = 9, height = 4, dpi = 300)
+```
+
+## A8. What the revenue floor is cutting -- underlies R10
+
+The main sample requires lagged revenue >= USD 10m. R10 in Table 11 asks how
+much that choice matters, two ways: raising the floor to USD 20m (does the
+result survive on an even cleaner sample?) and removing it entirely (does the
+result survive when small firms come back in?). This table and figure show,
+in firm-years, exactly what each of those two moves would add or remove --
+i.e. why R10 isn't a vacuous check.
+
+```{r}
+#| label: appx-a8-revenue-floor
+tabA8 <- data.table(
+  sample = c("Main (floor = USD 10m)", "Stricter (floor = USD 20m)", "No floor"),
+  firm_years = c(nrow(d), nrow(d[revt_usd_lag >= 20]), nrow(d_nofloor)),
+  vs_main = c(0, nrow(d[revt_usd_lag >= 20]) - nrow(d), nrow(d_nofloor) - nrow(d)))
+knitr::kable(tabA8, format.args = list(big.mark = ","),
+             caption = "Table A8: Firm-years under each revenue-floor variant tested in R10")
+fwrite(tabA8, file.path(out, "table_appx_A8_revenue_floor.csv"))
+
+# Distribution of revt_usd_lag among firm-years that are sample-eligible on
+# every OTHER criterion (d_nofloor) -- i.e. exactly the population the floor
+# decision is drawn from, not the raw, unfiltered panel (which also contains
+# financial firms, excluded industries, etc. that the floor choice never
+# touches either way).
+bins <- c(0, 5, 10, 15, 20, 25, 30, 50, 100, Inf)
+tabA8b <- d_nofloor[, .N, by = .(bin = cut(revt_usd_lag, bins, right = FALSE))][order(bin)]
+knitr::kable(tabA8b, format.args = list(big.mark = ","),
+             caption = "Table A8b: Firm-years by lagged revenue bin, USD million (sample-eligible except for the floor)")
+fwrite(tabA8b, file.path(out, "table_appx_A8b_revenue_bins.csv"))
+
+p_A8 <- ggplot(d_nofloor[revt_usd_lag >= 0 & revt_usd_lag < 60], aes(x = revt_usd_lag)) +
+  geom_histogram(binwidth = 2, fill = "grey25", colour = "white") +
+  geom_vline(xintercept = c(10, 20), linetype = "dashed") +
+  annotate("text", x = c(10, 20), y = Inf, label = c("USD 10m (main)", "USD 20m (R10)"), vjust = 1.3, hjust = -0.1,
+           family = "Times New Roman", size = 3) +
+  labs(x = "Revenue in t-1, USD million (truncated at 60)", y = "Firm-years",
+       title = "Figure A8: Where the revenue floor sits in the eligible sample") +
+  theme_thesis()
+p_A8
+ggsave(file.path(out, "fig_appx_A8_revenue_floor.png"), p_A8, width = 6, height = 4, dpi = 300)
+```
+
+## A9. Industry (2-digit SIC) distribution of the sample
+
+```{r}
+#| label: appx-a9-sic2
+# Standard two-digit SIC major-group titles (the official US SIC manual division
+# of 2-digit codes; this is a fixed public classification, not something inferred
+# from your data, so it can't drift the way a hand-guessed label could)
+sic2_titles <- c(
+  "01" = "Agricultural production - crops", "02" = "Agricultural production - livestock",
+  "07" = "Agricultural services", "08" = "Forestry", "09" = "Fishing, hunting, and trapping",
+  "10" = "Metal mining", "12" = "Coal mining", "13" = "Oil and gas extraction",
+  "14" = "Nonmetallic minerals mining", "15" = "Building construction - general contractors",
+  "16" = "Heavy construction, other than building", "17" = "Construction - special trade contractors",
+  "20" = "Food and kindred products", "21" = "Tobacco products", "22" = "Textile mill products",
+  "23" = "Apparel and other finished products", "24" = "Lumber and wood products",
+  "25" = "Furniture and fixtures", "26" = "Paper and allied products",
+  "27" = "Printing, publishing, and allied industries", "28" = "Chemicals and allied products",
+  "29" = "Petroleum refining and related industries", "30" = "Rubber and misc. plastics products",
+  "31" = "Leather and leather products", "32" = "Stone, clay, glass, and concrete products",
+  "33" = "Primary metal industries", "34" = "Fabricated metal products",
+  "35" = "Industrial and commercial machinery, computer equipment",
+  "36" = "Electronic and other electrical equipment", "37" = "Transportation equipment",
+  "38" = "Measuring, analyzing, and controlling instruments", "39" = "Misc. manufacturing industries",
+  "40" = "Railroad transportation", "41" = "Local and suburban transit",
+  "42" = "Motor freight transportation", "44" = "Water transportation", "45" = "Transportation by air",
+  "46" = "Pipelines, except natural gas", "47" = "Transportation services", "48" = "Communications",
+  "49" = "Electric, gas, and sanitary services", "50" = "Wholesale trade - durable goods",
+  "51" = "Wholesale trade - nondurable goods", "52" = "Building materials, hardware, garden supply",
+  "53" = "General merchandise stores", "54" = "Food stores",
+  "55" = "Automotive dealers and gas stations", "56" = "Apparel and accessory stores",
+  "57" = "Home furniture and furnishings stores", "58" = "Eating and drinking places",
+  "59" = "Miscellaneous retail", "60" = "Depository institutions", "61" = "Nondepository credit institutions",
+  "62" = "Security and commodity brokers", "63" = "Insurance carriers",
+  "64" = "Insurance agents, brokers, and service", "65" = "Real estate",
+  "67" = "Holding and other investment offices", "70" = "Hotels and other lodging places",
+  "72" = "Personal services", "73" = "Business services", "75" = "Automotive repair and services",
+  "76" = "Miscellaneous repair services", "78" = "Motion pictures", "79" = "Amusement and recreation services",
+  "80" = "Health services", "81" = "Legal services", "82" = "Educational services",
+  "83" = "Social services", "84" = "Museums, botanical and zoological gardens",
+  "86" = "Membership organizations", "87" = "Engineering, accounting, research, management services",
+  "88" = "Private households", "89" = "Services, not elsewhere classified",
+  "91" = "Executive, legislative, and general government", "92" = "Justice, public order, and safety",
+  "93" = "Public finance, taxation, and monetary policy", "94" = "Administration of human resources",
+  "95" = "Administration of environmental quality", "96" = "Administration of economic programs",
+  "97" = "National security and international affairs", "99" = "Nonclassifiable establishments")
+
+tabA9 <- d[, .(firm_years = .N), by = sic2][order(-firm_years)][1:20]
+tabA9[, `:=`(industry = sic2_titles[as.character(sic2)], share_pct = round(100 * firm_years / nrow(d), 1))]
+setcolorder(tabA9, c("sic2", "industry", "firm_years", "share_pct"))
+unlabelled <- tabA9[is.na(industry), as.character(sic2)]
+if (length(unlabelled) > 0) cat("SIC2 codes with no title in the dictionary above (check these):",
+                                 paste(unlabelled, collapse = ", "), "\n")
+knitr::kable(tabA9, format.args = list(big.mark = ","),
+             caption = "Table A9: Top 20 two-digit SIC industries by firm-years")
+fwrite(tabA9, file.path(out, "table_appx_A9_sic2.csv"))
+```
+
+# Appendix B: Full Regression Results
+
+Tables 8-10 in the main text show only the alliance-variable coefficients (and,
+for Table 9, not even the controls). This section reports every coefficient
+for H1, H2 and B1, using `fixest::etable()` so the format matches the main-text
+tables exactly (same stars, same "Fixed-Effects:" block). The eq/ne (governance)
+split of B1 is left out here -- it isn't discussed anywhere in the main text,
+so a full coefficient table for it would have nothing to anchor to.
+
+```{r}
+#| label: appx-b1-main-models
+m2_full <- est(rhs_h2)                 # H1 (Table 8, col b)
+m4_full <- est(rhs_h4)                 # H2 (Table 9)
+m1_full <- est(rhs_h1)                 # B1 (Table 10)
+
+etable(m2_full, m4_full, m1_full,
+       headers = c("H1", "H2", "B1"),
+       dict = c(cat_labels_paper, ln_at_usd = "Size (ln assets, USD)", roa_w = "ROA",
+                leverage_w = "Leverage", growth_l1_w = "Past growth"),
+       fitstat = ~ n + r2 + wr2,
+       tex = FALSE, file = file.path(out, "table_appx_B1_full_models.txt"), replace = TRUE)
+etable(m2_full, m4_full, m1_full,
+       headers = c("H1", "H2", "B1"),
+       dict = c(cat_labels_paper, ln_at_usd = "Size (ln assets, USD)", roa_w = "ROA",
+                leverage_w = "Leverage", growth_l1_w = "Past growth"),
+       fitstat = ~ n + r2 + wr2)
+```
+
+## B2. Robustness checks: full coefficients where they add something, p-values for all twelve
+
+Every one of the twelve checks gets its own `m2`-style model (H1 specification),
+but only some get a full coefficient table in the appendix text below: the ones
+where the coefficient *pattern* tells you something beyond the p-value Table 11
+already reports (R3, R4, the R7 window variants, R8-R12). The rest (R1, R2, R5,
+R6) are estimated here too and included in the p-value cross-check at the end
+of this chunk, so you can still verify them against Table 11, just without a
+full table taking up appendix space for a result that didn't move.
+
+```{r}
+#| label: appx-b2-robustness-models
+d[, sic2 := as.factor(sic2)]
+d[, t_c := as.numeric(fyear) - 2005]   # centred year, needed for gvkey[t_c] firm-specific linear trends (R5; same convention as file 07)
+med_size <- median(d$ln_at_usd, na.rm = TRUE)
+# d_nofloor was built in the setup chunk above (also used by Figure A8)
+
+m_R1  <- est(rhs_h2, fe = "gvkey + sic2^fyear")
+m_R2  <- est(rhs_h2, fe = "gvkey + country^fyear")
+m_R3  <- est(rhs_h2, fe = "sic2^fyear + country^fyear")
+m_R4  <- est(rhs_h2, ctrl = NULL)
+m_R5  <- est(rhs_h2, fe = "gvkey[t_c] + sic2^fyear + country^fyear")
+m_R6  <- est(rhs_h2, y = "growth_f1_w")
+# R7: four alliance-window variants (year t only -- the bare, un-windowed counts -- plus 2y/4y/5y; see 04_analysis_sample.qmd)
+m_R7_t  <- est(rhs_dist(""))
+m_R7_w2 <- est(rhs_dist("_w2"))
+m_R7_w4 <- est(rhs_dist("_w4"))
+m_R7_w5 <- est(rhs_dist("_w5"))
+
+# R8: placebo test, growth t-6 to t-3 (before the alliance window even opens).
+# Ported from 07_additional_robustness_checks.qmd's Panel B construction.
+rv <- fp[, .(gvkey, fyear, revt, curcd)]
+add_rev <- function(dt, k, name) {
+  x <- rv[, .(gvkey, fyear = fyear - as.integer(k), r = revt, cur = curcd)]
+  cols <- c(name, paste0(name, "_cur"))
+  setnames(x, c("r", "cur"), cols)
+  dt[x, on = .(gvkey, fyear), (cols) := mget(paste0("i.", cols))]
+  dt
+}
+ann <- function(r1, c1, r0, c0, n) fifelse(r1 > 0 & r0 > 0 & c1 == c0, (r1 / r0)^(1 / n) - 1, NA_real_)
+d <- add_rev(d, -6, "r_m6")
+d <- add_rev(d, -3, "r_m3")
+d[, g_pre := wins(ann(r_m3, r_m3_cur, r_m6, r_m6_cur, 3))]   # growth t-6 to t-3
+ctrl_placebo <- "ln_at_usd + roa_w + leverage_w"   # past growth is dropped: it lies after the outcome period
+m_R8a <- est(rhs_h2, y = "g_pre", ctrl = ctrl_placebo)
+m_R8b <- est(rhs_h2, y = "g_pre", ctrl = NULL)
+
+m_R9  <- est(rhs_h2, data = d[!(fyear %between% c(2009, 2015))])
+m_R10a <- est(rhs_h2, data = d[revt_usd_lag >= 20])
+m_R10b <- est(rhs_h2, data = d_nofloor)
+m_R11a <- est(rhs_h2, data = d[country == "USA"])
+m_R11b <- est(rhs_h2, data = d[country != "USA"])
+m_R12a <- est(rhs_h2, data = d[ln_at_usd <= med_size])
+m_R12b <- est(rhs_h2, data = d[ln_at_usd >  med_size])
+
+dict_appx <- c(cat_labels_paper, ln_at_usd = "Size (ln assets, USD)", roa_w = "ROA",
+               leverage_w = "Leverage", growth_l1_w = "Past growth")
+
+# Full coefficients only for R3 and R4: these are the two where the omnibus/
+# joint p-values in Table 11 actually move (R3 and R4 both go to p < 0.01),
+# so seeing the coefficient pattern tells you something -- most likely that
+# dropping the firm FE (R3) or the controls (R4) lets between-firm variation
+# leak back into the estimate. R1, R2, R5 and R6 all land close to the main
+# result (Table 11 p-values 0.26-0.60), so a full coefficient table for them
+# would just re-confirm "nothing changed" -- the p-value cross-check further
+# below covers that without spending appendix space on it.
+etable(m2_full, m_R3, m_R4,
+       headers = c("Main", "R3 (no firm FE)", "R4 (no controls)"),
+       dict = dict_appx, fitstat = ~ n + r2 + wr2,
+       file = file.path(out, "table_appx_B2a_robustness_R3_R4.txt"), replace = TRUE)
+etable(m2_full, m_R3, m_R4,
+       headers = c("Main", "R3 (no firm FE)", "R4 (no controls)"), dict = dict_appx, fitstat = ~ n + r2 + wr2)
+
+etable(m2_full, m_R7_t, m_R7_w2, m_R7_w4, m_R7_w5,
+       headers = c("Main (3y)", "R7 (year t only)", "R7 (2y window)", "R7 (4y window)", "R7 (5y window)"),
+       dict = dict_appx, fitstat = ~ n + r2 + wr2,
+       file = file.path(out, "table_appx_B2b_robustness_R7.txt"), replace = TRUE)
+etable(m2_full, m_R7_t, m_R7_w2, m_R7_w4, m_R7_w5,
+       headers = c("Main (3y)", "R7 (year t only)", "R7 (2y window)", "R7 (4y window)", "R7 (5y window)"),
+       dict = dict_appx, fitstat = ~ n + r2 + wr2)
+
+etable(m2_full, m_R8a, m_R8b, m_R9, m_R10a, m_R10b, m_R11a, m_R11b, m_R12a, m_R12b,
+       headers = c("Main", "R8 (placebo, controls)", "R8 (placebo, no controls)", "R9", "R10 (20m)",
+                   "R10 (no floor)", "R11 (US)", "R11 (non-US)", "R12 (below med.)", "R12 (above med.)"),
+       dict = dict_appx, fitstat = ~ n + r2 + wr2,
+       file = file.path(out, "table_appx_B2c_robustness_R8_R12.txt"), replace = TRUE)
+etable(m2_full, m_R8a, m_R8b, m_R9, m_R10a, m_R10b, m_R11a, m_R11b, m_R12a, m_R12b,
+       headers = c("Main", "R8 (placebo, controls)", "R8 (placebo, no controls)", "R9", "R10 (20m)",
+                   "R10 (no floor)", "R11 (US)", "R11 (non-US)", "R12 (below med.)", "R12 (above med.)"),
+       dict = dict_appx, fitstat = ~ n + r2 + wr2)
+
+# p-values, to cross-check these line up with the existing Table 11
+rbindlist(lapply(list(R1 = m_R1, R2 = m_R2, R3 = m_R3, R4 = m_R4, R5 = m_R5, R6 = m_R6,
+                       `R7 (t only)` = m_R7_t, `R7 (2y)` = m_R7_w2, `R7 (4y)` = m_R7_w4, `R7 (5y)` = m_R7_w5,
+                       `R8 (ctrl)` = m_R8a, `R8 (no ctrl)` = m_R8b, R9 = m_R9,
+                       `R10 (20m)` = m_R10a, `R10 (no floor)` = m_R10b,
+                       `R11 (US)` = m_R11a, `R11 (non-US)` = m_R11b,
+                       `R12 (below)` = m_R12a, `R12 (above)` = m_R12b),
+                  function(m) data.table(omnibus_p = round(omnibus_p(m), 4), joint_p = round(joint_p(m), 4))),
+          idcol = "check")
+```
+
+## B3. Exit rates by closest alliance distance category (R18-style diagnostic)
+
+```{r}
+#| label: appx-b3-attrition
+full <- copy(fp)
+for (k in cats) full[, (k) := get(paste0(k, "_eq")) + get(paste0(k, "_ne"))]
+setorder(full, gvkey, fyear)
+full[, fyear3 := fyear + 3L]
+full[full, on = .(gvkey, fyear3 = fyear), `:=`(revt_f3 = i.revt, curcd_f3 = i.curcd)]
+full[, has_t3 := as.integer(fifelse(revt > 0 & !is.na(revt_f3) & revt_f3 > 0 & curcd == curcd_f3, TRUE, FALSE, na = FALSE))]
+full <- full[!(financial %in% TRUE)]
+full <- full[!is.na(sic2) & !(as.integer(as.character(sic2)) %in% c(49, 99))]
+full <- full[revt_usd_lag >= 10]
+full[, fy_m1 := fyear - 1L]; full[, fy_m2 := fyear - 2L]
+for (v in cats) {
+  src <- full[, .(gvkey, fyear, val = get(v))]
+  full[src, on = .(gvkey, fy_m1 = fyear), m1 := i.val]
+  full[src, on = .(gvkey, fy_m2 = fyear), m2 := i.val]
+  full[, (paste0(v, "_3y")) := get(v) + fcoalesce(m1, 0L) + fcoalesce(m2, 0L)]
+  full[, c("m1", "m2") := NULL]
+}
+full[, closest := fifelse(d0_same4_3y > 0, "D0", fifelse(d1_same3_3y > 0, "D1",
+            fifelse(d2_same2_3y > 0, "D2", fifelse(d3_same_division_3y > 0, "D3",
+            fifelse(d4_diff_division_3y > 0, "D4", "No alliance")))))]
+
+tabB3 <- full[, .(firm_years = .N, share_without_growth = round(1 - mean(has_t3), 3)), by = closest]
+tabB3 <- tabB3[match(c("D0", "D1", "D2", "D3", "D4", "No alliance"), closest)]
+knitr::kable(tabB3, format.args = list(big.mark = ","),
+             caption = "Table B3: Exit rates by closest alliance distance category")
+fwrite(tabB3, file.path(out, "table_appx_B3_attrition.csv"))
+```
+
+# Appendix C: Supplementary Figures
+
+## C1. Coefficient patterns across all twelve robustness checks
+
+Extends the thesis's own Figure 8 (which shows R3, R4, R7, R11, R12) with the
+checks it leaves out, so every row of Table 11 has a picture, not just a
+p-value.
+
+```{r}
+#| label: appx-c1-coef-panels
+coef_df <- function(m, label) {
+  ct <- as.data.table(coeftable(m), keep.rownames = "term")[grepl("^log1p\\(d", term)]
+  ct[, `:=`(category = factor(cat_labels_paper, levels = cat_labels_paper), check = label,
+            est_pp = 100 * Estimate, lo = 100 * (Estimate - 1.96 * `Std. Error`),
+            hi = 100 * (Estimate + 1.96 * `Std. Error`))]
+  ct[, .(category, check, est_pp, lo, hi)]
+}
+
+panel_models <- list(`(a) R1: without country FE` = m_R1, `(b) R2: without industry FE` = m_R2,
+                     `(c) R9: excl. 2009-2015` = m_R9, `(d) R10: USD 20m floor` = m_R10a,
+                     `(e) R10: no revenue floor` = m_R10b, `(f) R11: non-US firms` = m_R11b)
+panel_data <- rbindlist(Map(coef_df, panel_models, names(panel_models)))
+panel_data[, check := factor(check, levels = names(panel_models))]
+
+p_C1 <- ggplot(panel_data, aes(x = category, y = est_pp)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_pointrange(aes(ymin = lo, ymax = hi)) +
+  geom_line(aes(group = check)) +
+  facet_wrap(~check, ncol = 3) +
+  scale_x_discrete(labels = c("D0", "D1", "D2", "D3", "D4")) +
+  labs(x = "Industry distance between partners", y = "Effect on annualised growth (pp)",
+       title = "Figure C1: Coefficient patterns for six further robustness checks") +
+  theme_thesis() + theme(axis.text.x = element_text(angle = 0))
+p_C1
+ggsave(file.path(out, "fig_appx_C1_robustness_panels.png"), p_C1, width = 10, height = 6.5, dpi = 300)
+```
+
+## C2. R10 (no revenue floor), full size -- the figure already referenced in section 5.1.1
+
+```{r}
+#| label: appx-c2-r10-single
+p_C2 <- ggplot(coef_df(m_R10b, "R10: no revenue floor"), aes(x = category, y = est_pp, group = 1)) +
+  geom_hline(yintercept = 0, linetype = "dashed", colour = "grey60") +
+  geom_pointrange(aes(ymin = lo, ymax = hi)) + geom_line() +
+  scale_x_discrete(labels = c("D0", "D1", "D2", "D3", "D4")) +
+  labs(x = "Industry distance between partners", y = "Effect on annualised growth (pp)",
+       title = "Figure C2: R10 (no revenue floor)") +
+  theme_thesis()
+p_C2
+ggsave(file.path(out, "fig_appx_C2_r10_no_floor.png"), p_C2, width = 5, height = 4, dpi = 300)
+```
+
+## Done
+
+```{r}
+#| label: appx-done
+cat("All appendix tables and figures written to:\n", out, "\n")
+list.files(out)
+```

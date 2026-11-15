@@ -1,0 +1,354 @@
+---
+title: "Part 5 Descriptive statistics"
+subtitle: "Master thesis Section 3.4 (Tables 4 and 6, Figure 5)"
+author: "Lara Mazzarelli"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+---
+
+## Role in the pipeline
+
+| | |
+|---|---|
+| **Thesis section** | 3.4 Descriptive statistics |
+| **Input** | `analysis_sample.rds` (file 4), `alliances_focal.rds` and `firmyear_panel.rds` (file 3) |
+| **Output** | `table4_summary_statistics.csv`, `table5_distance_governance.csv`, `fig2_alliance_activity.png`, further tables and checks |
+| **Previous / next file** | `04_analysis_sample.qmd` / `06_regressions.qmd` |
+
+All statistics use the **winsorised** variables (`_w`) of the analysis sample
+and the alliance counts of the **three-year window** (`_3y`), so that the
+table shows exactly the variables that enter the regressions.
+
+```{r}
+#| label: setup
+source("00_config.R")
+library(ggplot2)
+library(patchwork)
+
+d  <- readRDS(file.path(path, "analysis_sample.rds"))
+af <- readRDS(file.path(path, "alliances_focal.rds"))
+
+# alliance-firm observations inside the analysis sample (51,563)
+af_s <- af[d[, .(gvkey, fyear)], on = .(gvkey, year = fyear), nomatch = 0]
+c(firm_years = nrow(d), firms = uniqueN(d$gvkey), alliance_firm_obs = nrow(af_s))
+```
+
+## 1. Table 4: summary statistics of the regression variables
+
+```{r}
+#| label: table4
+vars <- c(growth_f3_w      = "Revenue growth, g (t to t+3)",
+          growth_l1_w      = "Past growth (t-2 to t-1)",
+          ln_at_usd        = "Size (ln total assets, USD)",
+          roa_w            = "ROA",
+          leverage_w       = "Leverage",
+          n_alliances_3y   = "All alliances",
+          n_rel_3y         = "Related alliances, RA",
+          n_unrel_3y       = "Unrelated alliances, UA",
+          n_jv_3y          = "Equity-based alliances, EQ",
+          n_ca_3y          = "Non-equity alliances, NE",
+          d0_same4_3y      = "D0 (same four-digit SIC)",
+          d1_same3_3y      = "D1 (same three-digit SIC)",
+          d2_same2_3y      = "D2 (same major group)",
+          d3_same_division_3y = "D3 (same SIC division)",
+          d4_diff_division_3y = "D4 (different SIC division)")
+count_vars <- grep("^(n_|d[0-4])", names(vars), value = TRUE)
+
+desc <- rbindlist(lapply(names(vars), function(v) {
+  x <- d[[v]]
+  data.table(variable = vars[[v]],
+             mean   = mean(x), sd = sd(x), min = min(x),
+             median = median(x), max = max(x),
+             firm_years_with_alliance_pct =
+               if (v %in% count_vars) 100 * mean(x > 0) else NA_real_)
+}))
+num_cols <- setdiff(names(desc), "variable")
+desc[, (num_cols) := lapply(.SD, round, 3), .SDcols = num_cols]
+knitr::kable(desc, caption = "Summary statistics (alliance counts in years t-2 to t)")
+fwrite(desc, file.path(path, "table4_summary_statistics.csv"))
+```
+
+Alliance formation is rare: the share of firm-years with at least one
+alliance is shown in the last column. With a one-year window it is lower
+(year t only versus the three-year window):
+
+```{r}
+#| label: window-share
+d[, .(share_year_t = round(mean(n_alliances > 0), 3),
+      share_3y_window = round(mean(n_alliances_3y > 0), 3))]
+```
+
+## 2. Do allying firms differ from non-allying firms?
+
+Allying = at least one alliance in the three-year window. Differences
+before any test explain why the regression needs controls and firm fixed effects.
+The more detailed breakdown by alliance distance category (Table 5 in the
+thesis, "Growth history and size by closest alliance distance") is computed in
+`06_regressions.qmd` instead, because it uses the regression-ready sample `d`
+built there rather than the raw panel used in this file.
+
+```{r}
+#| label: allying
+d[, allying := n_alliances_3y > 0]
+knitr::kable(d[, .N, by = allying])
+
+cmp_vars <- c(growth_f3_w = "Growth t to t+3 (annualised)",
+              growth_l1_w = "Past growth (t-2 to t-1)",
+              ln_at_usd   = "Size (ln total assets, USD)",
+              roa_w       = "ROA",
+              leverage_w  = "Leverage")
+
+comp <- rbindlist(lapply(names(cmp_vars), function(v) {
+  x1 <- d[allying == TRUE][[v]]
+  x0 <- d[allying == FALSE][[v]]
+  data.table(variable       = cmp_vars[[v]],
+             mean_allying   = mean(x1), mean_non   = mean(x0),
+             median_allying = median(x1), median_non = median(x0),
+             difference     = mean(x1) - mean(x0),
+             t_stat         = unname(t.test(x1, x0)$statistic))
+}))
+num <- setdiff(names(comp), "variable")
+comp[, (num) := lapply(.SD, round, 3), .SDcols = num]
+knitr::kable(comp, caption = "Firm-years with vs. without an alliance")
+fwrite(comp, file.path(path, "table_allying_vs_non.csv"))
+```
+
+## 3. Table 6: alliance-firm observations by distance category and governance form
+
+```{r}
+#| label: table5
+tab5 <- af_s[, .(observations = .N, equity_based = sum(jv)), by = category]
+tab5 <- tab5[match(cats, category)]
+tab5[, `:=`(label = cat_labels[category],
+            share_pct = round(100 * observations / sum(observations), 1),
+            equity_share_pct = round(100 * equity_based / observations, 1))]
+tab5 <- rbind(
+  tab5[, .(category = label, observations, share_pct, equity_based, equity_share_pct)],
+  data.table(category = "Total", observations = sum(tab5$observations), share_pct = 100,
+             equity_based = sum(tab5$equity_based),
+             equity_share_pct = round(100 * sum(tab5$equity_based) / sum(tab5$observations), 1)))
+knitr::kable(tab5, format.args = list(big.mark = ","))
+fwrite(tab5, file.path(path, "table5_distance_governance.csv"))
+```
+
+Correlation between the five distance counts (needed to justify estimating
+a separate coefficient for each category):
+
+```{r}
+#| label: cor-dist
+cm_d <- cor(d[, paste0(cats, "_3y"), with = FALSE])
+dimnames(cm_d) <- list(names(cat_labels), names(cat_labels))
+knitr::kable(round(cm_d, 2))
+max(cm_d[upper.tri(cm_d)])   # highest pairwise correlation
+```
+
+## 4. Figure 5: alliance activity over time
+
+Distinct alliances (deals) are counted, not alliance-firm observations (an
+alliance between two sample firms appears twice in `af_s`). Panel (b) corrects
+for the changing number of firms: it shows the share of sample firm-years with
+at least one alliance in year t. The shaded area marks the SDC coverage gap
+2009-2015.
+
+```{r}
+#| label: fig2
+#| fig-width: 9
+#| fig-height: 4
+
+per_year <- rbind(
+  af[,   .(n = uniqueN(deal)), by = year][, series := "Matched to Compustat"],
+  af_s[, .(n = uniqueN(deal)), by = year][, series := "In analysis sample"])
+per_year <- per_year[year %between% c(1990, 2021)]
+
+intensity <- d[, .(firm_years = .N, share = 100 * mean(n_alliances > 0)),
+               by = fyear][order(fyear)]
+
+gap <- annotate("rect", xmin = 2009, xmax = 2015, ymin = -Inf, ymax = Inf,
+                fill = "grey85", alpha = 0.7)
+gap_lab <- annotate("text", x = 2012, y = Inf, label = "2009-2015", vjust = 1.5,
+                    family = "Times New Roman", size = 3)
+
+p_a <- ggplot(per_year, aes(x = year, y = n, linetype = series)) +
+  gap + gap_lab +
+  geom_line(colour = "black", linewidth = 0.6) +
+  scale_linetype_manual(values = c("Matched to Compustat" = "solid",
+                                   "In analysis sample"   = "dashed")) +
+  scale_x_continuous(breaks = seq(1990, 2020, 5)) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "(a) Alliances per year", x = "Year", y = "Number of alliances",
+       linetype = NULL) +
+  theme_thesis()
+
+p_b <- ggplot(intensity, aes(x = fyear, y = share)) +
+  gap + gap_lab +
+  geom_line(colour = "black", linewidth = 0.6) +
+  scale_x_continuous(breaks = seq(1990, 2020, 5)) +
+  labs(title = "(b) Firm-years with an alliance in year t", x = "Year",
+       y = "Share of firm-years (%)") +
+  theme_thesis()
+
+fig2 <- p_a + p_b
+fig2
+ggsave(file.path(path, "fig2_alliance_activity.png"), fig2,
+       width = 9, height = 4, dpi = 300)
+
+knitr::kable(
+  dcast(per_year, year ~ series, value.var = "n")[year %in% 2006:2018],
+  caption = "Alliances per year around the coverage gap")
+knitr::kable(intensity[fyear %in% 2006:2018, .(fyear, firm_years, share = round(share, 1))])
+```
+
+
+## Reading of the 2009-2015 gap
+Recorded alliances drop abruptly from 2008 to 2009 and recover only from
+2016/2017 while the number of firms keeps growing. This pattern points to a
+change in SDC's data collection and not to firm behaviour (own inference; the
+LSEG support confirmed a change in coverage and scope but did not explain the
+2008-2009 drop). It is addressed with fixed effects and with robustness check
+R6 (exclude 2009-2015). The decline in panel (b) over the 1990s and 2000s is
+partly a composition effect: Compustat Global adds many smaller non-US firms
+(3,755 firm-years in 1990, 18,571 in 2009).
+:::
+
+## 5. Distance categories over time
+
+```{r}
+#| label: dist-time
+#| fig-width: 8
+#| fig-height: 4.5
+af_s[, cat_label := factor(cat_labels[category], levels = cat_labels)]
+af_s[, period := paste0((year %/% 10) * 10, "s")]
+
+tab <- af_s[, .N, by = .(period, cat_label)]
+tab[, share := round(N / sum(N), 3), by = period]
+tab_wide <- dcast(tab, cat_label ~ period, value.var = "share")
+overall  <- af_s[, .N, by = cat_label][, .(cat_label, all_years = round(N / sum(N), 3))]
+tab_wide <- overall[tab_wide, on = "cat_label"]
+knitr::kable(tab_wide, caption = "Share of each distance category, overall and per decade")
+fwrite(tab_wide, file.path(path, "table_distance_by_decade.csv"))
+
+p_dist <- ggplot(af_s[, .N, by = .(year, cat_label)],
+                 aes(x = year, y = N, fill = cat_label)) +
+  geom_col(position = "fill", width = 0.9, colour = "black", linewidth = 0.1) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_grey(start = 0.15, end = 0.95) +
+  labs(x = NULL, y = "Share of alliances", fill = NULL,
+       title = "Industry distance between alliance partners, 1990-2021") +
+  theme_thesis()
+p_dist
+ggsave(file.path(path, "fig_distance_by_year.png"), p_dist,
+       width = 8, height = 4.5, dpi = 300)
+```
+
+## 6. Correlations of the regression variables (Table 4, continued)
+
+```{r}
+#| label: correlations
+cor_vars <- c(growth_f3_w         = "Growth t to t+3",
+              growth_l1_w         = "Past growth",
+              ln_at_usd           = "Size",
+              roa_w               = "ROA",
+              leverage_w          = "Leverage",
+              n_alliances_3y      = "All alliances",
+              n_rel_3y            = "RA",
+              n_unrel_3y          = "UA",
+              n_jv_3y             = "EQ",
+              n_ca_3y             = "NE",
+              d0_same4_3y         = "D0",
+              d1_same3_3y         = "D1",
+              d2_same2_3y         = "D2",
+              d3_same_division_3y = "D3",
+              d4_diff_division_3y = "D4")
+
+cm <- cor(d[, names(cor_vars), with = FALSE])
+dimnames(cm) <- list(cor_vars, cor_vars)
+
+cm_tab <- round(cm, 2)
+cm_tab[upper.tri(cm_tab)] <- NA        # lower triangle only
+knitr::kable(cm_tab)
+fwrite(as.data.table(cm_tab, keep.rownames = "variable"),
+       file.path(path, "table_correlations.csv"))
+
+idx  <- which(abs(cm) >= 0.5 & upper.tri(cm), arr.ind = TRUE)
+knitr::kable(
+  data.table(var1 = rownames(cm)[idx[, 1]], var2 = colnames(cm)[idx[, 2]],
+             r = round(cm[idx], 2))[order(-abs(r))],
+  caption = "Pairs with |r| >= 0.5")
+```
+
+How to read the correlations: the total number of alliances is the sum of the
+five categories, so it is strongly correlated with them by construction. The
+total is therefore **never** used in the same model as the five categories.
+The five categories among each other are only moderately correlated, so all
+five can enter one model.
+
+## 7. Supplementary data checks (referenced in sections 3.2 and 3.3)
+
+### NAICS as an alternative industry classification (focal firms)
+
+```{r}
+#| label: naics-coverage
+fp <- readRDS(file.path(path, "firmyear_panel.rds"))
+fp[, naics_chr := as.character(naicsh)]
+fp[naics_chr == "", naics_chr := NA]
+
+cov <- fp[, .(share = round(mean(!is.na(naics_chr)), 2)), by = .(fyear, source)]
+knitr::kable(dcast(cov, fyear ~ source, value.var = "share")[fyear %in% seq(1990, 2020, 5)],
+             caption = "Share of firm-years with a NAICS code")
+
+knitr::kable(fp[!is.na(naics_chr), .N, by = .(source, digits = nchar(naics_chr))][order(source, digits)],
+             caption = "Number of digits of the NAICS codes")
+
+d[, .(naics = round(mean(!is.na(naicsh)), 3), sic = round(mean(!is.na(sic2)), 3))]
+```
+
+### NAICS: alliances where both partners have a code (robustness basis)
+
+```{r}
+#| label: naics-pairs
+both_deals <- af[, .N, by = deal][N == 2, deal]
+pg    <- af[deal %in% both_deals, .(deal, gvkey, year)]
+pairs <- pg[pg, on = .(deal, year), allow.cartesian = TRUE][
+  gvkey != i.gvkey, .(deal, year, gvkey, partner_gvkey = i.gvkey)]
+
+nai <- fp[, .(gvkey, fyear, naicsh)]
+pairs[nai, on = .(gvkey, year = fyear), focal_naics := i.naicsh]
+pairs[nai, on = .(partner_gvkey = gvkey, year = fyear), partner_naics := i.naicsh]
+
+af_s[pairs, on = .(deal, gvkey), `:=`(partner_in_cs = TRUE,
+                                      both_naics = !is.na(i.focal_naics) & !is.na(i.partner_naics))]
+af_s[is.na(partner_in_cs), `:=`(partner_in_cs = FALSE, both_naics = FALSE)]
+
+af_s[, .(obs = .N,
+         partner_in_compustat = round(mean(partner_in_cs), 3),
+         both_have_naics      = round(mean(both_naics), 3))]
+```
+
+### Segment data (diversification control not used)
+
+```{r}
+#| label: segments
+seg <- fread(file.path(path, "segments.csv"))
+seg[, gvkey := sprintf("%06d", as.integer(gvkey))]
+seg[, dd := as.Date(datadate)]
+seg[, fyear := fifelse(month(dd) >= 6, year(dd), year(dd) - 1L)]
+
+seg_ids <- unique(seg[, .(gvkey, fyear)])
+d[, has_seg := FALSE]
+d[seg_ids, on = .(gvkey, fyear), has_seg := TRUE]
+knitr::kable(d[, .(firm_years = .N, with_segments = round(mean(has_seg), 3)), by = source])
+```
+
+Compustat segment data cover North America only (89.0% of North American
+firm-years vs. 1.8% of Global firm-years). A Herfindahl or entropy control
+would therefore restrict the sample to roughly a fifth of the observations and
+remove its international character.

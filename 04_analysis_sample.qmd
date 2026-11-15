@@ -1,0 +1,253 @@
+---
+title: "Part 4 Variables, analysis sample and winsorisation"
+subtitle: "Master thesis Sections 3.2 (sample), 3.3 (variables), Table 2"
+author: "Lara Mazzarelli"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+---
+
+## Role in the pipeline
+
+| | |
+|---|---|
+| **Thesis section** | 3.2 analysis sample (Table 2), 3.3 variable definitions |
+| **Input** | `firmyear_panel.rds` (file 3), `sdc_counts.rds` (file 1), `link_counts.rds` (file 3) |
+| **Output** | `analysis_sample.rds` (the regression sample), `table2_sample_construction.csv`, `table_winsorisation.csv` |
+| **Previous / next file** | `03_linking_and_distance.qmd` / `05_descriptives.qmd` |
+
+The order of the steps follows the thesis:
+
+1. Alliance counts: categories, related/unrelated, governance split, three-year window
+2. Dependent variable: forward revenue growth (t to t+3, and t to t+1 for robustness)
+3. Analysis sample (all filters), i.e. Table 2
+4. Winsorisation within the analysis sample
+
+
+```{r}
+#| label: setup
+source("00_config.R")
+fp <- readRDS(file.path(path, "firmyear_panel.rds"))
+dim(fp)
+```
+
+## 1. Alliance counts
+
+```{r}
+#| label: counts
+# Totals per distance category (equity + non-equity), for H1 (and A1)
+for (k in cats) fp[, (k) := get(paste0(k, "_eq")) + get(paste0(k, "_ne"))]
+
+# Related (D0-D3) vs unrelated (D4), also split by governance (A2);
+# the five categories split by governance are used for H2;
+# non-equity alliances (n_ca) = all alliances that are not equity-based
+# (n_jv = equity-based: joint venture flag or equity-transfer technique)
+fp[, `:=`(n_rel      = d0_same4 + d1_same3 + d2_same2 + d3_same_division,
+          n_unrel    = d4_diff_division,
+          n_rel_eq   = d0_same4_eq + d1_same3_eq + d2_same2_eq + d3_same_division_eq,
+          n_rel_ne   = d0_same4_ne + d1_same3_ne + d2_same2_ne + d3_same_division_ne,
+          n_unrel_eq = d4_diff_division_eq,
+          n_unrel_ne = d4_diff_division_ne,
+          n_ca       = n_alliances - n_jv)]
+```
+
+### Alliance windows
+
+The main alliance variable counts alliances formed in years t-2 to t
+(three-year window, suffix `_3y`). The other windows (2, 4, 5 years) are only
+needed for the sensitivity check R5 and use the five category totals.
+Missing earlier years count as zero.
+
+```{r}
+#| label: windows
+# Sum of a variable over the years t, t-1, ..., t-(w-1) within firm
+add_window <- function(dt, vars, w, suffix) {
+  for (v in vars) {
+    out <- as.numeric(dt[[v]])
+    for (l in seq_len(w - 1)) {
+      src    <- dt[, .(gvkey, fyear = fyear + l, val = get(v))]
+      lagged <- src[dt[, .(gvkey, fyear)], on = .(gvkey, fyear), val]
+      out    <- out + fcoalesce(as.numeric(lagged), 0)
+    }
+    dt[, (paste0(v, suffix)) := out]
+  }
+}
+
+cnt_3y <- c("n_alliances", "n_jv", "n_ca", cats,
+            "n_rel", "n_unrel", "n_rel_eq", "n_rel_ne", "n_unrel_eq", "n_unrel_ne",
+            paste0(rep(cats, each = 2), c("_eq", "_ne")))
+
+setorder(fp, gvkey, fyear)
+add_window(fp, cnt_3y, 3, "_3y")                                # main specification
+for (w in c(2, 4, 5)) add_window(fp, cats, w, paste0("_w", w))  # check R5
+```
+
+## 2. Dependent variable: forward revenue growth
+
+Alliances in the window ending in t are followed by growth **after** t:
+
+* **Main model:** annualised growth from t to t+3 (equation 1 in the thesis),
+  `(Revenue[t+3] / Revenue[t])^(1/3) - 1`, in the firm's reporting currency
+* **Robustness R4:** growth from t to t+1
+
+Both are kept raw here (`growth_f3`, `growth_f1`) and winsorised in step 4.
+
+```{r}
+#| label: forward-growth
+fp[, `:=`(fyear1 = fyear + 1L, fyear3 = fyear + 3L)]
+
+# 1 year: the (raw) one-year growth of the following year
+fp[fp, on = .(gvkey, fyear1 = fyear), growth_f1 := i.growth]
+
+# 3 years: revenue in t+3 compared to t, annualised
+fp[fp, on = .(gvkey, fyear3 = fyear), `:=`(revt_f3 = i.revt, curcd_f3 = i.curcd)]
+fp[, growth_f3 := fifelse(revt > 0 & revt_f3 > 0 & curcd == curcd_f3,
+                          (revt_f3 / revt)^(1/3) - 1, NA_real_)]
+
+summary(fp$growth_f3)   # raw: extreme maximum -> reason for winsorising
+```
+
+## 3. Analysis sample (Table 2)
+
+Filters, in this order:
+
+1. no financial firms (SIC 60-69): revenues and balance sheets not comparable
+2. no utilities (SIC 49): regulated; and no unclassifiable firms (SIC 99) or
+   firms without any historical SIC (they remain eligible as alliance **partners**)
+3. lagged revenue of at least USD 10 million (t-1), because growth rates of very
+   small firms are volatile
+4. growth from t to t+3 and all controls available
+
+```{r}
+#| label: sample
+min_rev <- 10   # USD million
+
+n <- c("All Compustat firm-years" = nrow(fp))
+
+d <- fp[!(financial %in% TRUE)]
+n["Excl. financial firms"] <- nrow(d)
+
+d <- d[!is.na(sic2) & !(as.integer(as.character(sic2)) %in% c(49, 99))]
+n["Excl. utilities, unclassifiable, no historical SIC"] <- nrow(d)
+
+d <- d[revt_usd_lag >= min_rev]
+n["Revenue >= USD 10m in t-1"] <- nrow(d)
+
+d <- d[!is.na(growth_f3) & !is.na(ln_at_usd) & !is.na(roa) &
+         !is.na(leverage) & !is.na(growth_l1)]
+n["Growth t to t+3 and controls available"] <- nrow(d)
+
+sample_steps <- data.table(step = names(n), firm_years = as.integer(n))
+sample_steps[, removed := shift(firm_years) - firm_years]
+sample_steps[, removed_pct := round(100 * removed / shift(firm_years), 1)]
+knitr::kable(sample_steps, format.args = list(big.mark = ","),
+             caption = "Construction of the analysis sample (firm-years)")
+
+cat("Firms:", uniqueN(d$gvkey), " | Years:", min(d$fyear), "-", max(d$fyear), "\n")
+cat("Alliances in sample:", sum(d$n_alliances),
+    " | Firm-years with >= 1 alliance (year t):", d[n_alliances > 0, .N], "\n")
+```
+
+::: {.callout-note collapse="true"}
+## Documented decisions behind the sample
+
+* **SIC:** historical `sich` is available for 86.5% of firm-years, 10.7% can be filled
+  from another year of the same firm, 2.8% have no `sich` in any year and drop out.
+  Fill distance: 1-2 years 39%, 3-5 years 32%, more than 5 years 29%.
+* **USD floor:** converting revenue to USD before applying the floor reduced the sample from
+  494,382 to 461,882 firm-years (-6.6%) and the number of firms from 45,703 to 43,407;
+  alliances in the sample changed from 51,837 to 51,563 (-0.5%).
+:::
+
+### Table 2 (all three blocks)
+
+```{r}
+#| label: table2
+sdc_counts  <- readRDS(file.path(path, "sdc_counts.rds"))
+link_counts <- readRDS(file.path(path, "link_counts.rds"))
+
+table2 <- rbindlist(list(
+  data.table(block = "Step 1: SDC alliances (number of alliances)",
+             description = c("All alliances in the SDC extract",
+                             "Completed or signed, exactly two participants"),
+             number = c(sdc_counts$all_alliances, sdc_counts$kept_alliances)),
+  data.table(block = "Step 2: Compustat firm-years",
+             description = c("All Compustat firm-years, 1988-2024",
+                             "After excluding financial firms (SIC 60-69), utilities (SIC 49) & undefined industries (SIC 99)",
+                             "After requiring revenue of at least USD 10 million in t-1",
+                             "Analysis sample: firm-years 1990-2021 with all required variables"),
+             number = c(n[[1]], n[[3]], n[[4]], n[[5]])),
+  data.table(block = "Step 3: Linking alliances to Compustat firms (participants / alliance-firm obs.)",
+             description = c("Participant records of the alliances in Step 1 (two per alliance)",
+                             "After matching to a Compustat firm",
+                             "After removing affiliated firms & requiring SIC codes for both partners",
+                             "Analysis sample: alliance-firm observations 1990-2021"),
+             number = c(link_counts$participants, link_counts$matched,
+                        link_counts$final, sum(d$n_alliances)))))
+
+fwrite(table2, file.path(path, "table2_sample_construction.csv"))
+knitr::kable(table2, format.args = list(big.mark = ","))
+```
+
+## 4. Winsorisation within the analysis sample
+
+Percentiles are computed **after** the sample is fixed, on the 461,882
+firm-years that enter the regressions. Winsorised variables:
+
+| Variable | Raw | Winsorised |
+|---|---|---|
+| Revenue growth t to t+3 (dependent variable) | `growth_f3` | `growth_f3_w` |
+| Revenue growth t to t+1 (robustness R4) | `growth_f1` | `growth_f1_w` |
+| Past growth (t-2 to t-1) | `growth_l1` | `growth_l1_w` |
+| ROA | `roa` | `roa_w` |
+| Leverage | `leverage` | `leverage_w` |
+
+Alliance counts are not winsorised (they enter as `log(1 + count)`), and neither
+is size (`ln_at_usd`).
+
+```{r}
+#| label: winsorise
+wins <- function(x, p = 0.01) {
+  q <- quantile(x, c(p, 1 - p), na.rm = TRUE)
+  pmin(pmax(x, q[1]), q[2])
+}
+
+to_wins <- c(growth_f3 = "growth_f3_w", growth_f1 = "growth_f1_w",
+             growth_l1 = "growth_l1_w", roa = "roa_w", leverage = "leverage_w")
+for (v in names(to_wins)) d[, (to_wins[[v]]) := wins(get(v))]
+
+# Diagnostics: where are the cut-offs, how many observations are capped?
+wins_diag <- rbindlist(lapply(names(to_wins), function(v) {
+  x <- d[[v]]
+  q <- quantile(x, c(0.01, 0.99), na.rm = TRUE)
+  data.table(variable      = v,
+             raw_min       = min(x, na.rm = TRUE),
+             p01           = q[[1]],
+             p99           = q[[2]],
+             raw_max       = max(x, na.rm = TRUE),
+             share_capped  = mean(x < q[[1]] | x > q[[2]], na.rm = TRUE))
+}))
+num_cols <- setdiff(names(wins_diag), "variable")
+wins_diag[, (num_cols) := lapply(.SD, round, 4), .SDcols = num_cols]
+knitr::kable(wins_diag, caption = "Winsorisation at the 1st and 99th percentile of the analysis sample")
+fwrite(wins_diag, file.path(path, "table_winsorisation.csv"))
+
+# Checks: same sample size as before, no missing values in the regression variables
+stopifnot(!anyNA(d[, .(growth_f3_w, growth_l1_w, roa_w, leverage_w, ln_at_usd)]))
+nrow(d)   # should still be 461,882
+```
+
+## 5. Save
+
+```{r}
+#| label: save
+saveRDS(d, file.path(path, "analysis_sample.rds"))
+```

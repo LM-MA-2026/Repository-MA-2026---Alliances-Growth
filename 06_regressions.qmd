@@ -1,0 +1,772 @@
+---
+title: "Part 6 Regressions and robustness checks"
+subtitle: "Master thesis Section 3.5 (research design) and Chapter 4 (results)"
+author: "Lara Mazzarelli"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+---
+
+## Role in the pipeline
+
+| | |
+|---|---|
+| **Thesis section** | 3.4 selection check (Table 5), 3.5 research design (Table 7), 4.1-4.3 results, 4.4 robustness (Table 11) |
+| **Input** | `analysis_sample.rds` (file 4) |
+| **Output** | `table_main_results.csv`, `table_robustness.csv`, `table7_robustness_overview.csv`, `fig_coefficients_h1.png`, `fig_within_vs_between.png` |
+| **Previous file** | `05_descriptives.qmd` |
+
+
+## Hypotheses and models
+
+| Hypothesis | Model | Test (supported if) |
+|---|---|---|
+| **H1** industry distance has an inverted U-shaped effect on revenue growth | `m2` | omnibus equality test of the five distance coefficients (basis), joint test, pairwise contrasts |
+| **H2** the negative effect of large industry distance is weaker for equity-based than for non-equity alliances | `m4` | (D3_EQ - D4_EQ) - (D3_NE - D4_NE) < 0 |
+| *Additional analysis A1* (no hypothesis): related (D0-D3) vs. unrelated (D4) | `m1` | Wald test of RA - UA |
+| *Additional analysis A2* (no hypothesis): related-over-unrelated advantage by governance form | `m3` | (RA_EQ - UA_EQ) - (RA_NE - UA_NE) |
+
+The model names are the same as in the earlier version (`m1` to `m4`). H1 is the
+former H2, H2 is the former H4; the former H1 and H3 are reported as additional
+analyses without a hypothesis.
+
+**Main specification:** annualised revenue growth from t to t+3 on
+`log(1 + alliance counts in t-2 to t)`, four controls (size, ROA, leverage, past growth),
+firm fixed effects, industry x year and country x year fixed effects, standard
+errors clustered by firm. Firm age is not included (collinear with firm and year FE).
+
+```{r}
+#| label: setup
+source("00_config.R")
+library(fixest)
+library(ggplot2)
+
+d <- readRDS(file.path(path, "analysis_sample.rds"))
+d[, sic2 := as.factor(sic2)]
+
+c(firm_years = nrow(d), firms = uniqueN(d$gvkey),
+  countries = uniqueN(d$country), country_year_cells = uniqueN(paste(d$country, d$fyear)))
+```
+
+## Helper functions
+
+```{r}
+#| label: helpers
+# Does coefficient a differ from coefficient b? (uses the covariance of the two estimates)
+diff_test <- function(m, a, b) {
+  v   <- vcov(m)
+  est <- coef(m)[[a]] - coef(m)[[b]]
+  se  <- sqrt(v[a, a] + v[b, b] - 2 * v[a, b])
+  c(est = est, se = se, t = est / se, p = 2 * pnorm(-abs(est / se)))
+}
+
+# Any linear combination of coefficients (used for the H2 and A2 difference-in-differences)
+lin_test <- function(m, k, cv) {
+  b <- coef(m); V <- vcov(m)
+  est <- sum(cv * b[k])
+  se  <- sqrt(as.numeric(t(cv) %*% V[k, k] %*% cv))
+  c(est = est, se = se, t = est / se, p = 2 * pnorm(-abs(est / se)))
+}
+
+# Joint significance of the five distance coefficients (H1, fixest Wald test)
+joint_p <- function(m, pattern = "^log1p\\(d") {
+  wald(m, keep = pattern, print = FALSE)$p
+}
+
+# Omnibus test of H1: are the five distance coefficients equal to each other?
+# Four restrictions (D0 = D1, D1 = D2, D2 = D3, D3 = D4), chi-square Wald test
+omnibus_p <- function(m, pattern = "^log1p\\(d") {
+  nm <- grep(pattern, names(coef(m)), value = TRUE)
+  stopifnot(length(nm) == 5)
+  R <- matrix(0, nrow = 4, ncol = 5)
+  for (i in 1:4) { R[i, i] <- 1; R[i, i + 1] <- -1 }
+  rb   <- R %*% coef(m)[nm]
+  stat <- as.numeric(t(rb) %*% solve(R %*% vcov(m)[nm, nm] %*% t(R)) %*% rb)
+  pchisq(stat, df = 4, lower.tail = FALSE)
+}
+
+# p-value of A1 (related vs. unrelated) for any model whose first two coefficients are RA and UA
+h1_p <- function(m) {
+  nm <- names(coef(m))[1:2]
+  diff_test(m, nm[1], nm[2])[["p"]]
+}
+
+# One-row table from a test result
+tidy <- function(label, x) data.table(test = label, est = x[["est"]], se = x[["se"]],
+                                      t = x[["t"]], p = x[["p"]])
+```
+
+## Specification
+
+All models are built by one function, so that they differ only in the
+alliance variables (and in the one design choice that is varied in a robustness check).
+
+```{r}
+#| label: spec
+controls <- "ln_at_usd + roa_w + leverage_w + growth_l1_w"
+fe_main  <- "gvkey + sic2^fyear + country^fyear"
+
+est <- function(rhs, fe = fe_main, y = "growth_f3_w", data = d, ctrl = controls) {
+  rhs_all <- if (is.null(ctrl)) rhs else paste(rhs, "+", ctrl)
+  feols(as.formula(paste0(y, " ~ ", rhs_all, " | ", fe)),
+        data = data, cluster = ~gvkey)
+}
+
+# Alliance variables of the four models (window suffix: _3y = t-2 to t)
+# rhs_h1 = A1 (m1), rhs_h2 = H1 (m2), rhs_h3 = A2 (m3), rhs_h4 = H2 (m4)
+rhs_h1 <- "log1p(n_rel_3y) + log1p(n_unrel_3y)"
+rhs_dist <- function(suffix) paste0("log1p(", cats, suffix, ")", collapse = " + ")
+rhs_h2 <- rhs_dist("_3y")
+rhs_h3 <- paste("log1p(n_rel_eq_3y) + log1p(n_rel_ne_3y)",
+                "log1p(n_unrel_eq_3y) + log1p(n_unrel_ne_3y)", sep = " + ")
+rhs_h4 <- paste0(c(rbind(paste0("log1p(", cats, "_eq_3y)"),
+                         paste0("log1p(", cats, "_ne_3y)"))), collapse = " + ")
+
+# Readable labels for the tables
+dict <- c(growth_f3_w                  = "Revenue growth t to t+3",
+          growth_f1_w                  = "Revenue growth t to t+1",
+          "log1p(n_rel_3y)"            = "Related alliances (D0-D3)",
+          "log1p(n_unrel_3y)"          = "Unrelated alliances (D4)",
+          "log1p(d0_same4_3y)"         = "D0 same 4-digit",
+          "log1p(d1_same3_3y)"         = "D1 same 3-digit",
+          "log1p(d2_same2_3y)"         = "D2 same 2-digit",
+          "log1p(d3_same_division_3y)" = "D3 same division",
+          "log1p(d4_diff_division_3y)" = "D4 different division",
+          "log1p(d0_same4)"            = "D0 same 4-digit (year t)",
+          "log1p(d1_same3)"            = "D1 same 3-digit (year t)",
+          "log1p(d2_same2)"            = "D2 same 2-digit (year t)",
+          "log1p(d3_same_division)"    = "D3 same division (year t)",
+          "log1p(d4_diff_division)"    = "D4 different division (year t)",
+          "log1p(n_rel_eq_3y)"         = "Related, equity-based",
+          "log1p(n_rel_ne_3y)"         = "Related, non-equity",
+          "log1p(n_unrel_eq_3y)"       = "Unrelated, equity-based",
+          "log1p(n_unrel_ne_3y)"       = "Unrelated, non-equity",
+          ln_at_usd                    = "Size (ln assets, USD)",
+          roa_w                        = "ROA",
+          leverage_w                   = "Leverage",
+          growth_l1_w                  = "Past growth",
+          gvkey                        = "Firm",
+          "sic2^fyear"                 = "Industry x Year",
+          "country^fyear"              = "Country x Year")
+```
+
+## 1. H1: inverted U-shaped effect of industry distance
+
+**H1:** industry distance has an inverted U-shaped effect on a focal firm's subsequent revenue growth.
+
+One coefficient per category imposes no shape, so the data can show any
+pattern (a squared distance term would force a symmetric parabola). An
+inverted U requires the middle categories D1-D3 to exceed both extremes
+D0 and D4.
+
+```{r}
+#| label: m2
+m2 <- est(rhs_h2)
+summary(m2)
+
+nm2 <- function(k, suffix = "_3y") paste0("log1p(", k, suffix, ")")
+
+# (a) joint test, (b) omnibus test (basis for H1), (c) pairwise contrasts
+h1_global <- data.table(test = c("Joint significance of D0-D4", "Omnibus: all five equal"),
+                        p = c(joint_p(m2), omnibus_p(m2)))
+knitr::kable(h1_global, digits = 4)
+
+pr <- CJ(mid = cats[2:4], ext = cats[c(1, 5)], sorted = FALSE)
+pairwise <- rbindlist(lapply(seq_len(nrow(pr)), function(i) {
+  tidy(paste(pr$mid[i], "-", pr$ext[i]), diff_test(m2, nm2(pr$mid[i]), nm2(pr$ext[i])))
+}))
+knitr::kable(pairwise, digits = 4, caption = "Pairwise contrasts: middle category minus extreme")
+```
+
+
+### How the three tests fit together
+
+The joint test only asks whether distance matters at all; it can be significant
+because both extremes are negative, without any systematic variation with
+distance. The omnibus test asks whether the five coefficients differ from each
+other, which is the actual shape test. The pairwise contrasts are supporting
+evidence only: with six comparisons, one or two below 5% are expected by chance.
+
+
+## 2. H2: governance form moderates the effect of large distance
+
+**H2:** the negative effect of large industry distance on revenue growth is weaker for
+equity-based than for non-equity alliances.
+
+An alliance is equity-based if the SDC Joint Venture Flag is true (a new jointly
+owned entity was created) or if the Alliance Technique contains Equity Transfer
+or Cross Equity Transfer (see file 1, section 1b); all other alliances are
+non-equity (`equity_definition` in `00_config.R`). The governance form is defined
+at alliance level but the regression is at firm-year level, so the category counts
+are split by governance form instead of using an interaction term. This also works
+when a firm forms both types in the same year. Model `m4` therefore has ten alliance
+coefficients (five distance categories x two governance forms). The penalty of large
+distance is the decline from the moderate category D3 to D4; H2 holds if this decline
+is smaller for equity-based alliances.
+
+D3 is the moderate category (the intermediate category with the highest
+coefficient in the main distance model `m2` of H1; **check this after the re-run**,
+the choice is only valid if D3 is still the highest of D1-D3 in `m2`).
+
+```{r}
+#| label: m4
+m4 <- est(rhs_h4)
+summary(m4)
+
+# which intermediate category is highest in the main model?
+coef(m2)[nm2(cats[2:4])]
+
+k_h4 <- c("log1p(d3_same_division_eq_3y)", "log1p(d4_diff_division_eq_3y)",
+          "log1p(d3_same_division_ne_3y)", "log1p(d4_diff_division_ne_3y)")
+h2_tests <- rbind(
+  tidy("Decline D3 to D4, equity-based", diff_test(m4, k_h4[1], k_h4[2])),
+  tidy("Decline D3 to D4, non-equity",    diff_test(m4, k_h4[3], k_h4[4])),
+  tidy("H2: (D3_EQ - D4_EQ) - (D3_NE - D4_NE)", lin_test(m4, k_h4, c(1, -1, -1, 1))))
+knitr::kable(h2_tests, digits = 4)
+
+```{r}
+#| label: h2-close
+# H2, close end: the rise from D0 to D3 should be smaller for equity-based alliances
+k_h4_close <- c("log1p(d3_same_division_eq_3y)", "log1p(d0_same4_eq_3y)",
+                "log1p(d3_same_division_ne_3y)", "log1p(d0_same4_ne_3y)")
+h2_close <- rbind(
+  tidy("Rise D0 to D3, equity-based", diff_test(m4, k_h4_close[1], k_h4_close[2])),
+  tidy("Rise D0 to D3, non-equity",   diff_test(m4, k_h4_close[3], k_h4_close[4])),
+  tidy("H2 close end: (D3_EQ - D0_EQ) - (D3_NE - D0_NE)",
+       lin_test(m4, k_h4_close, c(1, -1, -1, 1))))
+knitr::kable(h2_close, digits = 4)
+```
+```
+
+
+## 3. Additional analyses
+
+### 3.1 B1: related (D0-D3) vs. unrelated (D4)
+
+Previous research mostly distinguishes related from unrelated alliances. This
+analysis keeps that comparison next to the five-category model of H1 (no hypothesis).
+
+```{r}
+#| label: m1
+m1 <- est(rhs_h1)
+summary(m1)
+
+# feols drops singleton observations (firms seen in only one year); they have
+# no within-firm variation. Number of observations actually used:
+c(sample = nrow(d), used = nobs(m1))
+
+knitr::kable(tidy("A1: related - unrelated", diff_test(m1, "log1p(n_rel_3y)", "log1p(n_unrel_3y)")),
+             digits = 4)
+```
+
+
+### 3.2 B2: related-over-unrelated advantage by governance form
+
+Same logic as H2 (counts split by governance form, equity definition as in section 2),
+but with the two relatedness groups instead of the five categories. No hypothesis.
+
+```{r}
+#| label: m3
+m3 <- est(rhs_h3)
+summary(m3)
+
+k_h3 <- c("log1p(n_rel_eq_3y)", "log1p(n_unrel_eq_3y)",
+          "log1p(n_rel_ne_3y)", "log1p(n_unrel_ne_3y)")
+
+h3 <- rbind(
+  tidy("Relatedness advantage, equity-based (RA_EQ - UA_EQ)",
+       diff_test(m3, "log1p(n_rel_eq_3y)", "log1p(n_unrel_eq_3y)")),
+  tidy("Relatedness advantage, non-equity (RA_NE - UA_NE)",
+       diff_test(m3, "log1p(n_rel_ne_3y)", "log1p(n_unrel_ne_3y)")),
+  tidy("A2: (RA_EQ - UA_EQ) - (RA_NE - UA_NE)", lin_test(m3, k_h3, c(1, -1, -1, 1))))
+knitr::kable(h3, digits = 4)
+
+# Firms with both alliance types over time
+firms_both <- d[, .(any_eq = any(n_jv_3y > 0), any_ne = any(n_ca_3y > 0)), by = gvkey]
+firms_both[, .(firms = .N,
+               with_equity = sum(any_eq), with_non_equity = sum(any_ne),
+               both_types = sum(any_eq & any_ne))]
+```
+
+
+### 3.3 Exploratory: equity main effect (not pre-specified)
+
+Average of the two equity coefficients minus the average of the two
+non-equity ones in model `m3`. It is supported ex ante by the commitment
+logic (Gulati & Singh, 1998; Kogut, 1988; Mowery et al., 1996) but was not
+a pre-specified hypothesis, so it is reported as exploratory.
+
+
+
+```{r}
+#| label: equity-main
+eq_main <- rbind(
+  tidy("Equity main effect (avg. equity-based - avg. non-equity)", lin_test(m3, k_h3, c(0.5, 0.5, -0.5, -0.5))),
+  tidy("Within related: equity-based - non-equity",   diff_test(m3, "log1p(n_rel_eq_3y)",   "log1p(n_rel_ne_3y)")),
+  tidy("Within unrelated: equity-based - non-equity", diff_test(m3, "log1p(n_unrel_eq_3y)", "log1p(n_unrel_ne_3y)")))
+knitr::kable(eq_main, digits = 4)
+```
+
+
+## 4. Robustness checks (numbering as in thesis 3.5.3 and Table 11)
+
+| Check | What is varied | Model |
+|---|---|---|
+| **R1** | without country x year FE | `m*_r1` |
+| **R2** | without industry x year FE | `m2_r2` |
+| **R3** | without firm FE | `m*_r3` |
+| **R4** | without control variables | `m*_nc` |
+| **R6** | one-year growth horizon | `m2_r4` |
+| **R7** | alliance window: year t only, 2, 4, 5 years | `m2_r5_*` |
+| **R9** | exclude 2009-2015 (SDC coverage gap) | `m*_r6` |
+| design | linear counts, any-alliance indicator, cut D2/D3 (all A1), USD 20m floor (H1) | `m1_lin`, `m1_dum`, `m1_c2`, `m2_f20` |
+| R19 (not in Table 11) | two-way clustering: firm and year (vs. firm only) | `m2_tw` |
+| R20 (not in Table 11) | quadratic-in-distance functional form (vs. five distance categories) | `m2_quad` |
+
+Each check changes one thing relative to the main specification. R8 to R18 are in
+a separate file (`07_additional_robustness_checks.qmd`); R19 and R20 are new here.
+
+
+
+```{r}
+#| label: robustness
+# R1-R3: fixed-effect structure
+fe_r1 <- "gvkey + sic2^fyear"
+fe_r2 <- "gvkey + country^fyear"
+fe_r3 <- "sic2^fyear + country^fyear"
+
+m1_r1 <- est(rhs_h1, fe_r1); m2_r1 <- est(rhs_h2, fe_r1); m3_r1 <- est(rhs_h3, fe_r1)
+m2_r2 <- est(rhs_h2, fe_r2)
+m1_r3 <- est(rhs_h1, fe_r3); m2_r3 <- est(rhs_h2, fe_r3)
+
+# R4: one-year growth horizon (winsorised within the analysis sample)
+m2_r4 <- est(rhs_h2, y = "growth_f1_w")
+
+# R5: alliance window
+m2_r5_t <- est(rhs_dist(""))      # alliances in year t only
+m2_r5_2 <- est(rhs_dist("_w2"))
+m2_r5_4 <- est(rhs_dist("_w4"))
+m2_r5_5 <- est(rhs_dist("_w5"))
+
+# R6: exclude the SDC coverage gap 2009-2015
+d_gap <- d[!(fyear %in% 2009:2015)]
+m2_r6 <- est(rhs_h2, data = d_gap)
+m3_r6 <- est(rhs_h3, data = d_gap)
+m4_r1 <- est(rhs_h4, fe_r1)          # H2 under R1
+m4_r3 <- est(rhs_h4, fe_r3)          # H2 under R3 (across firms)
+m4_r6 <- est(rhs_h4, data = d_gap)   # H2 under R6
+
+# Design choices
+m1_lin <- est("n_rel_3y + n_unrel_3y")                         # linear counts
+
+d[, `:=`(any_rel   = as.integer(n_rel_3y > 0),                 # any-alliance indicator
+         any_unrel = as.integer(n_unrel_3y > 0))]
+m1_dum <- est("any_rel + any_unrel")
+
+d[, `:=`(n_rel_c2   = d0_same4_3y + d1_same3_3y + d2_same2_3y,   # cut between D2 and D3
+         n_unrel_c2 = d3_same_division_3y + d4_diff_division_3y)]
+m1_c2 <- est("log1p(n_rel_c2) + log1p(n_unrel_c2)")
+
+m2_f20 <- est(rhs_h2, data = d[revt_usd_lag >= 20])            # USD 20 million revenue floor
+
+# Numbers needed for thesis section 3.3.2
+round(diff_test(m1_c2, "log1p(n_rel_c2)", "log1p(n_unrel_c2)"), 4)   # est = X (cut D2/D3)
+round(coef(m2_r5_5), 4)                                               # D4 coefficient at 5 years = Y
+
+# R4: without control variables
+m1_nc <- est(rhs_h1, ctrl = NULL)
+m2_nc <- est(rhs_h2, ctrl = NULL)
+m3_nc <- est(rhs_h3, ctrl = NULL)
+m4_nc <- est(rhs_h4, ctrl = NULL)
+
+# tests, same as in the main models (A1, H1, A2, H2)
+round(diff_test(m1_nc, "log1p(n_rel_3y)", "log1p(n_unrel_3y)"), 4)
+c(joint_p = joint_p(m2_nc), omnibus_p = omnibus_p(m2_nc))
+round(lin_test(m3_nc, k_h3, c(1, -1, -1, 1)), 4)
+round(lin_test(m4_nc, k_h4, c(1, -1, -1, 1)), 4)
+round(lin_test(m4_nc, k_h4_close, c(1, -1, -1, 1)), 4)
+
+# nine-column check for the table
+etable(m2_nc, m2, m4_nc, m4, m1_nc, m1, m3_nc, m3, dict = dict,
+       headers = c("H1 no ctrl", "H1", "H2 no ctrl", "H2", "A1 no ctrl", "A1", "A2 no ctrl", "A2"),
+       digits = 4, fitstat = ~ n + r2 + wr2)
+
+# direction of the R3 results (across firms)
+m1_r3 <- est(rhs_h1, fe = "sic2^fyear + country^fyear")
+m3_r3 <- est(rhs_h3, fe = "sic2^fyear + country^fyear")
+round(diff_test(m1_r3, "log1p(n_rel_3y)", "log1p(n_unrel_3y)"), 4)
+round(lin_test(m3_r3, k_h3, c(1, -1, -1, 1)), 4)
+round(lin_test(m4_r3, k_h4, c(1, -1, -1, 1)), 4)   # H2 across firms
+
+m2_r3 <- est(rhs_h2, fe = "sic2^fyear + country^fyear")
+round(coef(m2_r3)[grep("^log1p\\(d", names(coef(m2_r3)))], 4)
+round(diff_test(m2_r3, "log1p(d3_same_division_3y)", "log1p(d0_same4_3y)"), 4)
+round(diff_test(m2_r3, "log1p(d3_same_division_3y)", "log1p(d4_diff_division_3y)"), 4)
+```
+
+### R19: two-way clustering (firm and year)
+
+Standard errors are clustered by firm throughout. Firm-year observations within
+the same year can also be correlated (common macro or industry-wide shocks that
+the industry x year and country x year fixed effects do not fully absorb), so
+this check clusters two-way by firm and by fiscal year instead.
+
+```{r}
+#| label: r19-twoway
+m2_tw <- feols(as.formula(paste0("growth_f3_w ~ ", rhs_h2, " + ", controls, " | ", fe_main)),
+               data = d, cluster = ~gvkey + fyear)
+
+etable(m2, m2_tw, dict = dict, digits = 4, fitstat = ~ n + r2 + wr2,
+       headers = c("Main (cluster: firm)", "R19 (cluster: firm + year)"))
+round(c(main_omnibus_p = omnibus_p(m2), tw_omnibus_p = omnibus_p(m2_tw),
+        main_joint_p = joint_p(m2), tw_joint_p = joint_p(m2_tw)), 4)
+```
+
+### R20: quadratic-in-distance functional form
+
+The main specification (`m2`) imposes no shape on the five distance categories,
+so an inverted U is not assumed. This check instead collapses the five categories
+into one continuous distance score per firm-year -- the alliance-count-weighted
+mean of the category index 0 (D0) to 4 (D4) -- and tests a linear and a squared
+term on it. Firm-years with no alliance in the window get a distance of 0,
+consistent with how `log1p(N)` already treats "no alliance" as the reference
+case. An inverted U-shape implies a positive linear term and a negative squared
+term, jointly significant.
+
+```{r}
+#| label: r20-quadratic
+d[, n_all_3y := d0_same4_3y + d1_same3_3y + d2_same2_3y + d3_same_division_3y + d4_diff_division_3y]
+d[, avg_dist := fifelse(n_all_3y == 0, 0,
+                        (0 * d0_same4_3y + 1 * d1_same3_3y + 2 * d2_same2_3y +
+                           3 * d3_same_division_3y + 4 * d4_diff_division_3y) / n_all_3y)]
+d[, avg_dist_sq := avg_dist^2]
+
+m2_quad <- est("avg_dist + avg_dist_sq")
+summary(m2_quad)
+wald(m2_quad, keep = "avg_dist", print = FALSE)$p   # joint test of avg_dist and avg_dist_sq
+```
+
+
+### Table 7: overview of design choices
+
+Main p = p-value of the main specification; Alt. p = p-value of the alternative.
+For the H1 rows the joint test is reported as in the thesis; the omnibus test
+(the actual basis for H1) is added in the last two columns. The rows for the
+related/unrelated comparison belong to additional analysis A1. H2 is covered
+across the same design choices in the overview table below (`table9`).
+
+```{r}
+#| label: table7
+row7 <- function(group, choice, alternative, stat, m_main, m_alt) {
+  if (stat == "Joint test (H1)") {
+    data.table(group, choice, alternative, statistic = stat,
+               main_p = joint_p(m_main), alt_p = joint_p(m_alt),
+               main_omnibus_p = omnibus_p(m_main), alt_omnibus_p = omnibus_p(m_alt))
+  } else {
+    data.table(group, choice, alternative, statistic = stat,
+               main_p = h1_p(m_main), alt_p = h1_p(m_alt),
+               main_omnibus_p = NA_real_, alt_omnibus_p = NA_real_)
+  }
+}
+s_h1 <- "Joint test (H1)"; s_a1 <- "RA - UA (A1)"
+
+table7 <- rbindlist(list(
+  row7("Model",       "Country x year fixed effects", "R1: without them",           s_h1, m2, m2_r1),
+  row7("Model",       "Industry x year fixed effects", "R2: without them",          s_h1, m2, m2_r2),
+  row7("Model",       "Firm fixed effects",           "R3: without them",           s_h1, m2, m2_r3),
+  row7("Model", "Control variables", "R4: without them", s_h1, m2, m2_nc),
+  row7("Measurement", "Growth horizon: three years",  "R6: one-year growth",        s_h1, m2, m2_r4),
+  row7("Measurement", "Alliance window: three years", "R7: year t only",            s_h1, m2, m2_r5_t),
+  row7("Measurement", "Alliance window: three years", "R7: two years",              s_h1, m2, m2_r5_2),
+  row7("Measurement", "Alliance window: three years", "R7: four years",             s_h1, m2, m2_r5_4),
+  row7("Measurement", "Alliance window: three years", "R7: five years",             s_h1, m2, m2_r5_5),
+  row7("Measurement", "Alliance counts: ln(1 + N)",   "Linear counts",              s_a1, m1, m1_lin),
+  row7("Measurement", "Alliance counts: ln(1 + N)",   "Indicator for any alliance", s_a1, m1, m1_dum),
+  row7("Measurement", "Relatedness cut: D3 | D4",     "Cut between D2 and D3",      s_a1, m1, m1_c2),
+  row7("Sample",      "SDC coverage gap 2009-2015",   "R9: exclude these years",    s_h1, m2, m2_r6),
+  row7("Sample",      "Revenue floor: USD 10 million", "USD 20 million",            s_h1, m2, m2_f20)))
+
+knitr::kable(table7, digits = 4)
+fwrite(table7, file.path(path, "table7_robustness_overview.csv"))
+
+#| label: robustness-all
+# One row per design choice: p-values of the primary test of each hypothesis
+# (H1 = omnibus test of m2; H2 = moderation test of m4 at the far end (D3 to D4)
+#  and at the close end (D0 to D3); A1 and A2 = additional analyses)
+check_p <- function(label, fe = fe_main, y = "growth_f3_w", data = d, ctrl = controls) {
+  m1 <- est(rhs_h1, fe, y, data, ctrl)
+  m2 <- est(rhs_h2, fe, y, data, ctrl)
+  m3 <- est(rhs_h3, fe, y, data, ctrl)
+  m4 <- est(rhs_h4, fe, y, data, ctrl)
+  data.table(check = label,
+             H1_omnibus = omnibus_p(m2),
+             H1_joint   = joint_p(m2),
+             H2         = lin_test(m4, k_h4,       c(1, -1, -1, 1))[["p"]],
+             H2_close   = lin_test(m4, k_h4_close, c(1, -1, -1, 1))[["p"]],
+             A1         = diff_test(m1, "log1p(n_rel_3y)", "log1p(n_unrel_3y)")[["p"]],
+             A2         = lin_test(m3, k_h3, c(1, -1, -1, 1))[["p"]])
+}
+
+res <- rbindlist(list(
+  check_p("Main specification"),
+  check_p("R1: without country x year FE", fe = "gvkey + sic2^fyear"),
+  check_p("R2: without industry x year FE", fe = "gvkey + country^fyear"),
+  check_p("R3: without firm FE", fe = "sic2^fyear + country^fyear"),
+  check_p("R4: without controls", ctrl = NULL),
+  check_p("R6: one-year growth", y = "growth_f1_w"),
+  check_p("R9: excluding 2009-2015", data = d[!(fyear %in% 2009:2015)]),
+  check_p("USD 20 million floor", data = d[revt_usd_lag >= 20])
+))
+num <- setdiff(names(res), "check")
+res[, (num) := lapply(.SD, round, 4), .SDcols = num]
+knitr::kable(res)
+fwrite(res, file.path(path, "table9_all_hypotheses.csv"))
+```
+
+### Governance effects under R1 and R9
+
+```{r}
+#| label: equity-robust
+knitr::kable(rbind(
+  tidy("Main: H2 moderation",           lin_test(m4,    k_h4, c(1, -1, -1, 1))),
+  tidy("R1: H2 moderation",             lin_test(m4_r1, k_h4, c(1, -1, -1, 1))),
+  tidy("R9: H2 moderation",             lin_test(m4_r6, k_h4, c(1, -1, -1, 1))),
+  tidy("Main: A2 moderation",           lin_test(m3,    k_h3, c(1, -1, -1, 1))),
+  tidy("R1: A2 moderation",             lin_test(m3_r1, k_h3, c(1, -1, -1, 1))),
+  tidy("R9: A2 moderation",             lin_test(m3_r6, k_h3, c(1, -1, -1, 1))),
+  tidy("Main: equity main effect",      lin_test(m3,    k_h3, c(0.5, 0.5, -0.5, -0.5))),
+  tidy("R1: equity main effect",        lin_test(m3_r1, k_h3, c(0.5, 0.5, -0.5, -0.5))),
+  tidy("R9: equity main effect",        lin_test(m3_r6, k_h3, c(0.5, 0.5, -0.5, -0.5)))),
+  digits = 4)
+```
+
+## 5. Regression tables
+
+```{r}
+#| label: tables
+ord <- c("D0", "D1", "D2", "D3", "D4", "Related", "Unrelated")
+
+tab_main <- etable(m2_r1, m2, m4, m1_r1, m1, m3, dict = dict,
+                   headers = c("H1 (R1)", "H1", "H2", "A1 (R1)", "A1", "A2"),
+                   digits = 4, fitstat = ~ n + r2 + wr2, order = ord)
+knitr::kable(tab_main)
+fwrite(as.data.table(tab_main), file.path(path, "table_main_results.csv"))
+
+tab_rob <- etable(m2, m2_r1, m2_r2, m2_r3, m2_r4, m2_r6, m2_r5_t, m2_f20, dict = dict,
+                  headers = c("Main", "R1", "R2", "R3", "R6 (1-yr growth)", "R9 (excl. 2009-15)",
+                              "R7 (year t)", "USD 20m floor"),
+                  digits = 4, fitstat = ~ n + r2 + wr2)
+knitr::kable(tab_rob)
+fwrite(as.data.table(tab_rob), file.path(path, "table_robustness.csv"))
+```
+
+The relevant R² is the **within** R² (`wr2`), the share of variation explained
+after the fixed effects are taken out; `summary()` reports the adjusted R², `etable()`
+the plain R².
+
+## 6. Figures
+
+### Distance effect (H1)
+
+```{r}
+#| label: fig-coef
+#| fig-width: 6.3
+#| fig-height: 3.8
+fam <- "Times New Roman"
+show_band <- TRUE   # TRUE = grey area for the moderate categories, FALSE = no area
+
+co <- as.data.table(coeftable(m2), keep.rownames = "term")[grepl("^log1p\\(d", term)]
+setnames(co, c("Estimate", "Std. Error"), c("est", "se"))
+co[, `:=`(est = 100 * est, se = 100 * se)]            # percentage points
+lab <- c("D0\nsame 4-digit", "D1\nsame 3-digit", "D2\nsame major group",
+         "D3\nsame division", "D4\ndifferent division")
+co[, `:=`(x = 1:5, lo = est - 1.96 * se, hi = est + 1.96 * se)]
+co[, txt := sub("-", "\u2212", sprintf("%.2f", est))]  # proper minus sign
+
+# smooth inverted-U curve: quadratic fit to the five estimates (illustration only)
+fit   <- lm(est ~ x + I(x^2), data = co)
+curve <- data.table(x = seq(1, 5, length.out = 100))
+curve[, y := predict(fit, newdata = curve)]
+
+p_coef <- ggplot(co, aes(x = x, y = est)) +
+  { if (show_band) annotate("rect", xmin = 1.5, xmax = 4.5, ymin = -Inf, ymax = Inf, fill = "grey92") } +
+  { if (show_band) annotate("text", x = 3, y = 1.02, label = "Moderate distance (D1\u2013D3)",
+                            family = fam, fontface = "bold", size = 3.9, colour = "black") } +
+  geom_hline(yintercept = 0, colour = "grey80", linewidth = 0.3) +
+  geom_line(data = curve, aes(x = x, y = y), colour = "grey30",
+            linetype = "dashed", linewidth = 0.6) +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.08, linewidth = 0.5, colour = "black") +
+  geom_point(size = 2.4, colour = "black") +
+  geom_text(aes(y = hi, label = txt), vjust = -0.6, family = fam, size = 3.8) +
+  scale_x_continuous(breaks = 1:5, labels = lab, expand = expansion(add = 0.45)) +
+  scale_y_continuous(breaks = seq(-1, 1, 0.5),
+                     labels = function(x) sub("-", "\u2212", format(x, nsmall = 1))) +
+  coord_cartesian(ylim = c(-1.4, 1.1)) +
+  labs(x = "Industry distance between partners",
+       y = "Effect on annualised growth (pp)") +
+  theme_classic(base_size = 11, base_family = fam) +
+  theme(axis.text    = element_text(colour = "black", size = 10.5),
+        axis.title   = element_text(colour = "black", size = 12),
+        axis.title.x = element_text(margin = margin(t = 10)),
+        axis.title.y = element_text(margin = margin(r = 10)),
+        axis.line    = element_line(colour = "black", linewidth = 0.4),
+        axis.ticks   = element_line(colour = "black", linewidth = 0.4))
+p_coef
+ggsave(file.path(path, "fig_coefficients_h1.png"), p_coef,
+       width = 6.3, height = 3.8, dpi = 300)
+```
+
+### Distance effects across design choices
+
+```{r}
+```{r}
+#| label: fig-panels
+#| fig-width: 7.5
+#| fig-height: 5.4
+fam <- "Times New Roman"
+
+get_co <- function(m, spec) {
+  x <- as.data.table(coeftable(m), keep.rownames = "term")[grepl("^log1p\\(d", term)]
+  setnames(x, c("Estimate", "Std. Error"), c("est", "se"))
+  x[, `:=`(est = 100 * est, se = 100 * se, spec = spec, x = 1:5)]      # percentage points
+  x[, `:=`(lo = est - 1.96 * se, hi = est + 1.96 * se)]
+}
+
+m2_r11 <- est(rhs_h2, data = d[country == "USA"])
+med_size_for_panels <- median(d$ln_at_usd, na.rm = TRUE)
+m2_r12 <- est(rhs_h2, data = d[ln_at_usd <= med_size_for_panels])
+
+lev <- c("(a) Main\nspecification",
+         "(b) Without firm\nfixed effects (R3)",
+         "(c) Without control\nvariables (R4)",
+         "(d) Five-year\nalliance window (R7)",
+         "(e) United States\nfirms (R11)",
+         "(f) Firms below\nmedian size (R12)")
+d <- rbind(get_co(m2,      lev[1]),
+           get_co(m2_r3,   lev[2]),
+           get_co(m2_nc,   lev[3]),
+           get_co(m2_r5_5, lev[4]),
+           get_co(m2_r11,  lev[5]),
+           get_co(m2_r12,  lev[6]))
+d[, spec := factor(spec, levels = lev)]
+
+# main specification as a grey dashed reference line in panels (b) to (d)
+ref <- d[spec == lev[1], .(x, est_ref = est)]
+dr  <- d[spec != lev[1]][ref, on = "x", nomatch = 0]
+
+p_panels <- ggplot(d, aes(x = x, y = est)) +
+  geom_hline(yintercept = 0, colour = "grey80", linewidth = 0.3) +
+  geom_line(data = dr, aes(y = est_ref, group = spec), colour = "grey75",
+            linewidth = 0.6, linetype = "dashed") +
+  geom_line(colour = "black", linewidth = 0.6) +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.12, linewidth = 0.5, colour = "black") +
+  geom_point(size = 2.4, colour = "black") +
+  facet_wrap(~ spec, nrow = 2) +
+  scale_x_continuous(breaks = 1:5, labels = paste0("D", 0:4), expand = expansion(add = 0.3)) +
+  scale_y_continuous(breaks = seq(-2, 2, 1),
+                     labels = function(x) sub("-", "\u2212", format(x, nsmall = 1))) +
+  coord_cartesian(ylim = c(-2.4, 2.0)) +
+  labs(x = "Industry distance between partners", y = "Effect on annualised growth (pp)") +
+  theme_classic(base_size = 11, base_family = fam) +
+  theme(strip.background = element_blank(),
+        strip.text   = element_text(face = "bold", size = 9, hjust = 0.5),
+        axis.text    = element_text(colour = "black", size = 9),
+        axis.title   = element_text(colour = "black", size = 11.5),
+        axis.title.x = element_text(margin = margin(t = 8)),
+        axis.title.y = element_text(margin = margin(r = 8)),
+        axis.line    = element_line(colour = "black", linewidth = 0.4),
+        axis.ticks   = element_line(colour = "black", linewidth = 0.4),
+        panel.spacing = unit(0.5, "lines"))
+p_panels
+ggsave(file.path(path, "fig_panels.png"), p_panels, width = 7.5, height = 5.4, dpi = 300)
+```
+
+### Governance form (H2)
+
+```{r}
+#| label: fig-h2
+#| fig-width: 7.4
+#| fig-height: 3.8
+fam   <- "Times New Roman"
+dodge <- 0.12   # small horizontal offset so the two series do not overlap
+
+cf <- as.data.table(coeftable(m4), keep.rownames = "term")[
+  grepl("^log1p\\(d[0-4]_.*_(eq|ne)_3y\\)$", term)]
+setnames(cf, c("Estimate", "Std. Error"), c("est", "se"))
+cf[, `:=`(est = 100 * est, se = 100 * se)]                       # percentage points
+cf[, gov := factor(ifelse(grepl("_eq_3y", term), "Equity-based", "Non-equity"),
+                   levels = c("Equity-based", "Non-equity"))]
+cf[, x  := as.integer(sub("^log1p\\(d([0-4]).*$", "\\1", term)) + 1L]
+cf[, xp := x + ifelse(gov == "Equity-based", -dodge, dodge)]
+cf[, `:=`(lo = est - 1.96 * se, hi = est + 1.96 * se)]
+stopifnot(nrow(cf) == 10)
+
+lab2 <- c("D0\nsame 4-digit", "D1\nsame 3-digit", "D2\nsame major group",
+          "D3\nsame division", "D4\ndifferent division")
+
+p_h2 <- ggplot(cf, aes(x = xp, y = est, group = gov)) +
+  annotate("rect", xmin = 1.5, xmax = 4.5, ymin = -Inf, ymax = Inf, fill = "grey92") +
+  annotate("text", x = 3, y = 1.2, label = "Moderate distance (D1\u2013D3)",
+           family = fam, fontface = "bold", size = 3.9, colour = "black") +
+  geom_hline(yintercept = 0, colour = "grey80", linewidth = 0.3) +
+  geom_line(aes(colour = gov, linetype = gov), linewidth = 0.6) +
+  geom_errorbar(aes(ymin = lo, ymax = hi, colour = gov), width = 0.08, linewidth = 0.5) +
+  geom_point(aes(colour = gov, shape = gov), size = 2.4) +
+  scale_colour_manual(NULL, values = c("black", "grey45")) +
+  scale_shape_manual(NULL,  values = c(16, 17)) +
+  scale_linetype_manual(NULL, values = c("solid", "dashed")) +
+  scale_x_continuous(breaks = 1:5, labels = lab2, expand = expansion(add = 0.45)) +
+  scale_y_continuous(breaks = seq(-2, 1, 1),
+                     labels = function(x) sub("-", "\u2212", format(x, nsmall = 1))) +
+  coord_cartesian(ylim = c(-2.3, 1.4)) +
+  labs(x = "Industry distance between partners",
+       y = "Effect on annualised growth (pp)") +
+  theme_classic(base_size = 11, base_family = fam) +
+  theme(axis.text    = element_text(colour = "black", size = 10.5),
+        axis.title   = element_text(colour = "black", size = 12),
+        axis.title.x = element_text(margin = margin(t = 10)),
+        axis.title.y = element_text(margin = margin(r = 10)),
+        axis.line    = element_line(colour = "black", linewidth = 0.4),
+        axis.ticks   = element_line(colour = "black", linewidth = 0.4),
+        legend.position      = "right",
+        legend.direction     = "vertical",
+        legend.justification = "center",
+        legend.text          = element_text(size = 10.5),
+        legend.key.width     = grid::unit(1.2, "cm"),
+        legend.margin        = margin(l = 8))
+p_h2
+ggsave(file.path(path, "fig_coefficients_h2.png"), p_h2,
+       width = 7.4, height = 3.8, dpi = 300)
+```
+
+`````{r}
+#| label: selection-check
+# Table 5 in the thesis: growth history and size by closest alliance distance.
+# Computed here rather than in 05_descriptives.qmd because it needs the
+# regression-ready sample d built in this file.
+# Do firm-years with close partners already differ in growth history and size?
+cnt <- paste0(cats, "_3y")
+dd  <- copy(d)
+dd[, closest := NA_character_]
+for (k in rev(seq_along(cats))) dd[get(cnt[k]) > 0, closest := cats[k]]   # the closest category is written last
+dd[is.na(closest), closest := "no alliance"]
+dd[, closest := factor(closest, levels = c("no alliance", cats))]
+sel <- dd[, .(firm_years          = .N,
+              past_growth_median  = median(growth_l1_w, na.rm = TRUE),
+              past_growth_mean    = mean(growth_l1_w,   na.rm = TRUE),
+              size_median         = median(ln_at_usd,   na.rm = TRUE),
+              leverage_median     = median(leverage_w,  na.rm = TRUE),
+              roa_median          = median(roa_w,       na.rm = TRUE)),
+          by = closest][order(closest)]
+knitr::kable(sel, digits = 3, caption = "Table 5: Growth history and size by closest alliance distance")
+````
+```
+
