@@ -1,13 +1,13 @@
 ---
-title: "Part 8 Appendix tables and figures"
-subtitle: "Master thesis Appendix (sample description, full regression results, supplementary figures)"
+title: "Part 8 Appendix"
+subtitle: "Sample description, full regression results, supplementary figures"
 author: "Lara Mazzarelli"
 format:
   html:
     toc: true
     toc-depth: 2
     code-fold: true
-    code-tools: true
+    code-tools: false
     embed-resources: true
     theme: cosmo
 execute:
@@ -19,26 +19,10 @@ execute:
 
 | | |
 |---|---|
-| **Thesis section** | Appendix (no narrative text in the appendix itself -- tables and figures only) |
-| **Input** | `analysis_sample.rds`, `firmyear_panel.rds`, `alliances_focal.rds` (files 1/3/4) |
-| **Output** | every `table_appx_*.csv` and `fig_appx_*.png` in `appendix_out_v2/` |
-| **Previous file** | `07_additional_robustness_checks.qmd` |
+| **Thesis section** | Appendix |
+| **Previous file** | `07_robustness_checks.qmd` |
 
-This file replaces the appendix tables that were originally typed up by hand
-from numbers in various CSVs, and the loose R script that produced the R10
-coefficient figure. Every table and figure below is built here from the saved
-`.rds` files, with the same helper functions, labels and fixed effects as
-files 06 and 07. Knit it, then pull the tables/figures from
-`appendix_out_v2/` into the Word appendix.
-
-**Numbering.** Files 06 and 07 used different internal numbers for the same
-robustness check at different points while the thesis text was being drafted
-(e.g. the "US firms" split was called R11, R15 and other things). The list
-below is the numbering **as it stands in the current thesis text (Table
-11)**, confirmed against the thesis's own Figure 8 panel labels. Use this
-list, not a chunk or object name elsewhere:
-
-| Final label | What it is | Filter / change vs. main specification |
+| Robustness check | What it is | Filter / change vs. main specification |
 |---|---|---|
 | R1 | without country x year FE | `fe` drops `country^fyear` |
 | R2 | without industry x year FE | `fe` drops `sic2^fyear` |
@@ -66,13 +50,7 @@ library(countrycode)
 library(scales)
 
 out <- file.path(path, "appendix_out_v2")
-# Wipe and recreate on every knit, rather than just adding to it. We've renamed
-# and dropped several tables/figures across revisions of this file, and fwrite()/
-# ggsave() only ever add or overwrite -- they never delete a file an earlier
-# version of this script wrote but the current one doesn't. Without this, the
-# folder silently accumulates stale leftovers (old filenames, cut sections)
-# alongside the current ones, which is exactly the trap appendix_out/ (the
-# pre-this-file folder) fell into.
+
 unlink(out, recursive = TRUE)
 dir.create(out)
 
@@ -161,10 +139,7 @@ cat("no-floor sample:", nrow(d_nofloor), " | main sample (floor = USD 10m):", nr
 # Appendix A: Sample Description
 
 This section describes the analysis sample by country, region, firm size and
-time -- none of it is regression output, so none of it can be "wrong" in the
-way a mis-specified model can be, but it is exactly the material an examiner
-checks first when a thesis claims a result holds "mainly for US firms" or
-"mainly for smaller firms" (sections 5.1.1 and 5.3).
+time.
 
 ## A1. Firm-years and firms by country
 
@@ -195,11 +170,6 @@ ggsave(file.path(out, "fig_appx_A1_country.png"), p_A1, width = 7, height = 5, d
 
 ## A2. Firm-years and firms by region
 
-`country` codes come from Compustat (`fic` for North America, `loc` for
-Global). They map onto `countrycode`'s ISO3c almost completely; any that do
-not are printed below so you can patch `fix_region` rather than silently
-dropping firms into "Unmapped".
-
 ```{r}
 #| label: appx-a2-region
 fix_region <- c(ANT = "Caribbean")  # Netherlands Antilles (dissolved 2010); not in countrycode's iso3c table
@@ -229,8 +199,6 @@ ggsave(file.path(out, "fig_appx_A2_region.png"), p_A2, width = 7, height = 4.5, 
 ```
 
 ## A3. Distance categories by firm location (United States vs. rest of sample) -- underlies R11
-
-Directly supports section 5.1.1's claim that H1 is driven by United States firms.
 
 ```{r}
 #| label: appx-a3-us-split
@@ -317,8 +285,7 @@ ggsave(file.path(out, "fig_appx_A6_panel_structure.png"), p_A6, width = 6, heigh
 
 ## A7. Firm-years by year, and number of distinct firms/countries per year
 
-Complements Figure 5 (which counts alliances, not firm-years) and gives the
-full year range rather than the 2006-2018 excerpt in section 5.1.1's SDC-gap discussion.
+Complements Figure 5 (which counts alliances, but not firm-years).
 
 ```{r}
 #| label: appx-a7-by-year
@@ -345,12 +312,11 @@ ggsave(file.path(out, "fig_appx_A7_by_year.png"), fig_A7, width = 9, height = 4,
 
 ## A8. What the revenue floor is cutting -- underlies R10
 
-The main sample requires lagged revenue >= USD 10m. R10 in Table 11 asks how
-much that choice matters, two ways: raising the floor to USD 20m (does the
-result survive on an even cleaner sample?) and removing it entirely (does the
+The main sample has a USD 10m revenue floor. R10 in Table 11 asks how
+much that choice matters,in two ways: (1) by raising the floor to USD 20m (does the
+result survive on an even cleaner sample?) and (2) by removing it entirely (does the
 result survive when small firms come back in?). This table and figure show,
-in firm-years, exactly what each of those two moves would add or remove --
-i.e. why R10 isn't a vacuous check.
+in firm-years, exactly what each of those two moves would add or remove.
 
 ```{r}
 #| label: appx-a8-revenue-floor
@@ -442,14 +408,36 @@ knitr::kable(tabA9, format.args = list(big.mark = ","),
 fwrite(tabA9, file.path(out, "table_appx_A9_sic2.csv"))
 ```
 
+## A10. Industry distance between alliance partners, by decade
+
+```{r}
+#| label: appx-a10-distance-over-time
+af_s[, cat_label := factor(cat_labels[category], levels = cat_labels)]
+af_s[, period := paste0((year %/% 10) * 10, "s")]
+
+tabA10 <- af_s[, .N, by = .(period, cat_label)]
+tabA10[, share := round(N / sum(N), 3), by = period]
+tabA10_wide <- dcast(tabA10, cat_label ~ period, value.var = "share")
+overall10   <- af_s[, .N, by = cat_label][, .(cat_label, all_years = round(N / sum(N), 3))]
+tabA10_wide <- overall10[tabA10_wide, on = "cat_label"]
+knitr::kable(tabA10_wide, caption = "Table A10: Industry distance between alliance partners, by decade")
+fwrite(tabA10_wide, file.path(out, "table_appx_A10_distance_by_decade.csv"))
+
+figA10 <- ggplot(af_s[, .N, by = .(year, cat_label)],
+                 aes(x = year, y = N, fill = cat_label)) +
+  geom_col(position = "fill", width = 0.9, colour = "black", linewidth = 0.1) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_fill_grey(start = 0.15, end = 0.95) +
+  labs(x = NULL, y = "Share of alliances", fill = NULL,
+       title = "Figure A10: Industry distance between alliance partners, 1990-2021") +
+  theme_thesis()
+figA10
+ggsave(file.path(out, "fig_appx_A10_distance_by_year.png"), figA10, width = 8, height = 4.5, dpi = 300)
+```
+
 # Appendix B: Full Regression Results
 
-Tables 8-10 in the main text show only the alliance-variable coefficients (and,
-for Table 9, not even the controls). This section reports every coefficient
-for H1, H2 and B1, using `fixest::etable()` so the format matches the main-text
-tables exactly (same stars, same "Fixed-Effects:" block). The eq/ne (governance)
-split of B1 is left out here -- it isn't discussed anywhere in the main text,
-so a full coefficient table for it would have nothing to anchor to.
+This section reports every coefficient for H1, H2 and B1.
 
 ```{r}
 #| label: appx-b1-main-models
@@ -463,22 +451,15 @@ etable(m2_full, m4_full, m1_full,
                 leverage_w = "Leverage", growth_l1_w = "Past growth"),
        fitstat = ~ n + r2 + wr2,
        tex = FALSE, file = file.path(out, "table_appx_B1_full_models.txt"), replace = TRUE)
-etable(m2_full, m4_full, m1_full,
+tab_appx_b1 <- etable(m2_full, m4_full, m1_full,
        headers = c("H1", "H2", "B1"),
        dict = c(cat_labels_paper, ln_at_usd = "Size (ln assets, USD)", roa_w = "ROA",
                 leverage_w = "Leverage", growth_l1_w = "Past growth"),
-       fitstat = ~ n + r2 + wr2)
+       fitstat = ~ n + r2 + wr2, tex = FALSE)
+knitr::kable(tab_appx_b1)
 ```
 
 ## B2. Robustness checks: full coefficients where they add something, p-values for all twelve
-
-Every one of the twelve checks gets its own `m2`-style model (H1 specification),
-but only some get a full coefficient table in the appendix text below: the ones
-where the coefficient *pattern* tells you something beyond the p-value Table 11
-already reports (R3, R4, the R7 window variants, R8-R12). The rest (R1, R2, R5,
-R6) are estimated here too and included in the p-value cross-check at the end
-of this chunk, so you can still verify them against Table 11, just without a
-full table taking up appendix space for a result that didn't move.
 
 ```{r}
 #| label: appx-b2-robustness-models
@@ -500,7 +481,7 @@ m_R7_w4 <- est(rhs_dist("_w4"))
 m_R7_w5 <- est(rhs_dist("_w5"))
 
 # R8: placebo test, growth t-6 to t-3 (before the alliance window even opens).
-# Ported from 07_additional_robustness_checks.qmd's Panel B construction.
+# Ported from 07_robustness_checks.qmd's Panel B construction.
 rv <- fp[, .(gvkey, fyear, revt, curcd)]
 add_rev <- function(dt, k, name) {
   x <- rv[, .(gvkey, fyear = fyear - as.integer(k), r = revt, cur = curcd)]
@@ -540,29 +521,32 @@ etable(m2_full, m_R3, m_R4,
        headers = c("Main", "R3 (no firm FE)", "R4 (no controls)"),
        dict = dict_appx, fitstat = ~ n + r2 + wr2,
        file = file.path(out, "table_appx_B2a_robustness_R3_R4.txt"), replace = TRUE)
-etable(m2_full, m_R3, m_R4,
-       headers = c("Main", "R3 (no firm FE)", "R4 (no controls)"), dict = dict_appx, fitstat = ~ n + r2 + wr2)
+tab_appx_b2a <- etable(m2_full, m_R3, m_R4,
+       headers = c("Main", "R3 (no firm FE)", "R4 (no controls)"), dict = dict_appx, fitstat = ~ n + r2 + wr2, tex = FALSE)
+knitr::kable(tab_appx_b2a)
 
 etable(m2_full, m_R7_t, m_R7_w2, m_R7_w4, m_R7_w5,
        headers = c("Main (3y)", "R7 (year t only)", "R7 (2y window)", "R7 (4y window)", "R7 (5y window)"),
        dict = dict_appx, fitstat = ~ n + r2 + wr2,
        file = file.path(out, "table_appx_B2b_robustness_R7.txt"), replace = TRUE)
-etable(m2_full, m_R7_t, m_R7_w2, m_R7_w4, m_R7_w5,
+tab_appx_b2b <- etable(m2_full, m_R7_t, m_R7_w2, m_R7_w4, m_R7_w5,
        headers = c("Main (3y)", "R7 (year t only)", "R7 (2y window)", "R7 (4y window)", "R7 (5y window)"),
-       dict = dict_appx, fitstat = ~ n + r2 + wr2)
+       dict = dict_appx, fitstat = ~ n + r2 + wr2, tex = FALSE)
+knitr::kable(tab_appx_b2b)
 
 etable(m2_full, m_R8a, m_R8b, m_R9, m_R10a, m_R10b, m_R11a, m_R11b, m_R12a, m_R12b,
        headers = c("Main", "R8 (placebo, controls)", "R8 (placebo, no controls)", "R9", "R10 (20m)",
                    "R10 (no floor)", "R11 (US)", "R11 (non-US)", "R12 (below med.)", "R12 (above med.)"),
        dict = dict_appx, fitstat = ~ n + r2 + wr2,
        file = file.path(out, "table_appx_B2c_robustness_R8_R12.txt"), replace = TRUE)
-etable(m2_full, m_R8a, m_R8b, m_R9, m_R10a, m_R10b, m_R11a, m_R11b, m_R12a, m_R12b,
+tab_appx_b2c <- etable(m2_full, m_R8a, m_R8b, m_R9, m_R10a, m_R10b, m_R11a, m_R11b, m_R12a, m_R12b,
        headers = c("Main", "R8 (placebo, controls)", "R8 (placebo, no controls)", "R9", "R10 (20m)",
                    "R10 (no floor)", "R11 (US)", "R11 (non-US)", "R12 (below med.)", "R12 (above med.)"),
-       dict = dict_appx, fitstat = ~ n + r2 + wr2)
+       dict = dict_appx, fitstat = ~ n + r2 + wr2, tex = FALSE)
+knitr::kable(tab_appx_b2c)
 
 # p-values, to cross-check these line up with the existing Table 11
-rbindlist(lapply(list(R1 = m_R1, R2 = m_R2, R3 = m_R3, R4 = m_R4, R5 = m_R5, R6 = m_R6,
+tab_pcheck <- rbindlist(lapply(list(R1 = m_R1, R2 = m_R2, R3 = m_R3, R4 = m_R4, R5 = m_R5, R6 = m_R6,
                        `R7 (t only)` = m_R7_t, `R7 (2y)` = m_R7_w2, `R7 (4y)` = m_R7_w4, `R7 (5y)` = m_R7_w5,
                        `R8 (ctrl)` = m_R8a, `R8 (no ctrl)` = m_R8b, R9 = m_R9,
                        `R10 (20m)` = m_R10a, `R10 (no floor)` = m_R10b,
@@ -570,9 +554,10 @@ rbindlist(lapply(list(R1 = m_R1, R2 = m_R2, R3 = m_R3, R4 = m_R4, R5 = m_R5, R6 
                        `R12 (below)` = m_R12a, `R12 (above)` = m_R12b),
                   function(m) data.table(omnibus_p = round(omnibus_p(m), 4), joint_p = round(joint_p(m), 4))),
           idcol = "check")
+knitr::kable(tab_pcheck)
 ```
 
-## B3. Exit rates by closest alliance distance category (R18-style diagnostic)
+## B3. Exit rates by closest alliance distance category
 
 ```{r}
 #| label: appx-b3-attrition
@@ -607,10 +592,6 @@ fwrite(tabB3, file.path(out, "table_appx_B3_attrition.csv"))
 # Appendix C: Supplementary Figures
 
 ## C1. Coefficient patterns across all twelve robustness checks
-
-Extends the thesis's own Figure 8 (which shows R3, R4, R7, R11, R12) with the
-checks it leaves out, so every row of Table 11 has a picture, not just a
-p-value.
 
 ```{r}
 #| label: appx-c1-coef-panels

@@ -7,7 +7,7 @@ format:
     toc: true
     toc-depth: 2
     code-fold: true
-    code-tools: true
+    code-tools: false
     embed-resources: true
     theme: cosmo
 execute:
@@ -20,8 +20,6 @@ execute:
 | | |
 |---|---|
 | **Thesis section** | 3.4 Descriptive statistics |
-| **Input** | `analysis_sample.rds` (file 4), `alliances_focal.rds` and `firmyear_panel.rds` (file 3) |
-| **Output** | `table4_summary_statistics.csv`, `table5_distance_governance.csv`, `fig2_alliance_activity.png`, further tables and checks |
 | **Previous / next file** | `04_analysis_sample.qmd` / `06_regressions.qmd` |
 
 All statistics use the **winsorised** variables (`_w`) of the analysis sample
@@ -137,7 +135,7 @@ tab5 <- rbind(
              equity_based = sum(tab5$equity_based),
              equity_share_pct = round(100 * sum(tab5$equity_based) / sum(tab5$observations), 1)))
 knitr::kable(tab5, format.args = list(big.mark = ","))
-fwrite(tab5, file.path(path, "table5_distance_governance.csv"))
+fwrite(tab5, file.path(path, "table6_distance_governance.csv"))
 ```
 
 Correlation between the five distance counts (needed to justify estimating
@@ -198,7 +196,7 @@ p_b <- ggplot(intensity, aes(x = fyear, y = share)) +
 
 fig2 <- p_a + p_b
 fig2
-ggsave(file.path(path, "fig2_alliance_activity.png"), fig2,
+ggsave(file.path(path, "fig5_alliance_activity.png"), fig2,
        width = 9, height = 4, dpi = 300)
 
 knitr::kable(

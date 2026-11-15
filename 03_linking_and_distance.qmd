@@ -7,7 +7,7 @@ format:
     toc: true
     toc-depth: 2
     code-fold: true
-    code-tools: true
+    code-tools: false
     embed-resources: true
     theme: cosmo
 execute:
@@ -20,8 +20,6 @@ execute:
 | | |
 |---|---|
 | **Thesis section** | 3.2 (four-step matching), 3.3.2 (distance categories D0-D4) |
-| **Input** | `sdc_participants.rds` (file 1), `compustat_panel.rds` (file 2), Compustat identifier files |
-| **Output** | `alliances_focal.rds` (one row per alliance-firm observation), `firmyear_panel.rds` (panel + alliance counts), `link_counts.rds` (numbers for Table 2) |
 | **Previous / next file** | `02_firm_data.qmd` / `04_analysis_sample.qmd` |
 
 SDC and Compustat share no firm identifier. Participants are therefore matched

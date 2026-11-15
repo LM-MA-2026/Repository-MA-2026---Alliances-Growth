@@ -18,7 +18,7 @@ output:
 | `04_analysis_sample.qmd` | Builds the final analysis sample and variable set (Table 2) | 3.2, 3.3 |
 | `05_descriptives.qmd` | Descriptive statistics and figures (Tables 4 and 6, Figure 5) | 3.4 |
 | `06_regressions.qmd` | Main regressions for H1/H2, the benchmark analysis, and Table 5 (selection check) | 3.5, 4 |
-| `07_additional_robustness_checks.qmd` | Robustness checks R5 and R8, plus supplementary checks not in the main Table 11 | 3.5.3, 4.4 |
+| `07_robustness_checks.qmd` | All robustness checks (R1-R20) | 3.5.3, 4.4 |
 | `08_appendix_tables.qmd` | All appendix tables and figures, and the definitive R1-R12 robustness-check numbering | Appendix |
 
 `00_config.R` holds settings shared across all files (the data folder path,

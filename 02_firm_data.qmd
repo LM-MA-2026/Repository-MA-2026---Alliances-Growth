@@ -7,7 +7,7 @@ format:
     toc: true
     toc-depth: 2
     code-fold: true
-    code-tools: true
+    code-tools: false
     embed-resources: true
     theme: cosmo
 execute:
@@ -20,8 +20,6 @@ execute:
 | | |
 |---|---|
 | **Thesis section** | 3.2 Firm data and analysis sample (panel construction) |
-| **Input** | `Compustat North America Data.csv`, `Compustat Global Data Start 1988.csv`, `exchange_rates.csv` |
-| **Output** | `compustat_panel.rds` (firm-year panel, 1988-2024) |
 | **Previous / next file** | `01_alliance_data.qmd` / `03_linking_and_distance.qmd` |
 
 This file builds the firm-year panel from Compustat North America and

@@ -7,7 +7,7 @@ format:
     toc: true
     toc-depth: 2
     code-fold: true
-    code-tools: true
+    code-tools: false
     embed-resources: true
     theme: cosmo
 execute:
@@ -20,8 +20,6 @@ execute:
 | | |
 |---|---|
 | **Thesis section** | 3.2 analysis sample (Table 2), 3.3 variable definitions |
-| **Input** | `firmyear_panel.rds` (file 3), `sdc_counts.rds` (file 1), `link_counts.rds` (file 3) |
-| **Output** | `analysis_sample.rds` (the regression sample), `table2_sample_construction.csv`, `table_winsorisation.csv` |
 | **Previous / next file** | `03_linking_and_distance.qmd` / `05_descriptives.qmd` |
 
 The order of the steps follows the thesis:
